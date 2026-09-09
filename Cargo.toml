@@ -1,0 +1,37 @@
+[package]
+name = "baidupan-fuse"
+version = "0.1.0"
+edition = "2021"
+description = "百度网盘 FUSE 挂载(只读)——Linux/macOS"
+license = "MIT"
+
+# 二进制名用短名 bdfs:裸跑进交互控制台,子命令供脚本用
+[[bin]]
+name = "bdfs"
+path = "src/main.rs"
+
+# FUSE 用户态文件系统
+# Linux:关掉默认的 libfuse feature,走纯 Rust 挂载实现(不依赖系统 libfuse);
+# macOS:libfuse feature 会通过 pkg-config 找 macFUSE/FUSE-T,保持默认
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.15", default-features = false, features = ["abi-7-28"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+fuser = "0.15"
+
+[dependencies]
+# HTTP 客户端,blocking 模式(fuser 的 Filesystem 是同步 trait,不需要 tokio)
+# rustls 避免交叉编译时链 openssl;multipart 给上传分片用(superfile2)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "multipart"] }
+md5 = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+strip = true
