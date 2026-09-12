@@ -148,9 +148,11 @@ fn mount(st: &Settings) -> Result<()> {
         MountOption::FSName("bdfs".into()),
         MountOption::Subtype("baidupan".into()),
         // 默认读写:写改动 close 时三段式上传;设置里开了只读才挂 RO
-        // 挂载进程退出时自动卸载
-        MountOption::AutoUnmount,
     ];
+    // 挂载进程退出时自动卸载;AutoUnmount 依赖 fusermount,没有的环境(如 Android)跳过
+    if crate::fs::have_fusermount() {
+        opts.push(MountOption::AutoUnmount);
+    }
     if st.readonly {
         opts.push(MountOption::RO);
     }

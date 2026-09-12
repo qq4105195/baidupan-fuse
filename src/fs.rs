@@ -40,6 +40,20 @@ pub fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+/// fusermount 是否可用。AutoUnmount 的卸载(以及挂载本身)在 fuser 里强制走
+/// fusermount3/fusermount 外部二进制;Android 等没有它的环境会直接 ENOENT。
+/// 此时调用方应跳过 AutoUnmount,让 fuser 走 root 直连 mount(2) 的路径。
+pub fn have_fusermount() -> bool {
+    ["fusermount3", "fusermount"].iter().any(|n| {
+        std::process::Command::new(n)
+            .arg("-h")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    })
+}
+
 /// 父目录:"/" 的父还是 "/"
 pub fn parent_of(path: &str) -> String {
     match path.rfind('/') {

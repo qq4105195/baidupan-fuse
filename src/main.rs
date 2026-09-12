@@ -168,10 +168,16 @@ fn main() -> Result<()> {
                 MountOption::FSName("bdfs".into()),
                 MountOption::Subtype("baidupan".into()),
                 // 默认读写;--read-only 让写操作在内核层就被拒绝(应用拿到 EROFS)
-                // 挂载进程退出时自动卸载,避免留下访问不了的挂载点
-                MountOption::AutoUnmount,
                 // 注:内核 attr 缓存时长由我们在 reply.entry/attr 里返回的 TTL 驱动
             ];
+            // 挂载进程退出时自动卸载,避免留下访问不了的挂载点。
+            // AutoUnmount 依赖 fusermount 二进制,没有时(如 Android)跳过,
+            // 挂载走 root 直连 mount(2),退出由 Drop 里的 umount 收尾
+            if fs::have_fusermount() {
+                opts.push(MountOption::AutoUnmount);
+            } else {
+                println!("提示:未找到 fusermount,跳过 AutoUnmount;进程被杀后挂载点若残留,umount 清理");
+            }
             if read_only {
                 opts.push(MountOption::RO);
             }
