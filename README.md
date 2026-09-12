@@ -8,6 +8,8 @@
 - 写:改动先落本地暂存,close 时按官方三段式(precreate → 4MB 分片 superfile2 → create)
   传回网盘;mkdir/改名/删除/截断都支持。要挡写挂载时加 `--read-only`(内核层 EROFS)
 - 目录列表 / attr / dlink 三级内存缓存,应对 FUSE 的调用风暴和 API 配额限制
+- 可部署到 Android 设备(实测中兴 F50 Pro 随身路由,root):网盘直接变成局域网
+  SMB 共享,教程见 [docs/deploy-f50pro.md](docs/deploy-f50pro.md)
 
 ## 准备
 
