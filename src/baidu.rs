@@ -79,8 +79,15 @@ pub struct Token {
     pub expires_at: u64,
 }
 
-/// 配置目录:~/.config/baidupan-fuse/(macOS/Linux 通用)
+/// 配置目录:Linux/macOS ~/.config/baidupan-fuse;Windows %APPDATA%\baidupan-fuse
 pub fn config_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        // Windows 标准漫游配置位置;拿不到(极罕见)再退回 HOME 方案
+        if let Some(ad) = std::env::var_os("APPDATA") {
+            return PathBuf::from(ad).join("baidupan-fuse");
+        }
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));

@@ -1,4 +1,5 @@
-//! 交互控制台的持久化设置:~/.config/baidupan-fuse/settings.json。
+//! 交互控制台的持久化设置:Linux/macOS ~/.config/baidupan-fuse/settings.json,
+//! Windows %APPDATA%\baidupan-fuse\settings.json。
 //! 「7. 设置」改、「3. 挂载」用、装 systemd 服务时生成 ExecStart 也用。
 //! 注意:CLI 子命令 mount 的参数优先级高于这里的值(脚本场景显式优先),
 //! 菜单场景则完全以这份设置为准。
@@ -27,6 +28,8 @@ pub struct Settings {
     pub allow_other: bool,
     /// 只读挂载(默认 false:写支持已上线,要挡写用这个)
     pub readonly: bool,
+    /// Windows 同步根目录(OneDrive 式按需文件夹,Explorer 侧边栏可见)
+    pub sync_root: String,
 }
 
 impl Default for Settings {
@@ -41,7 +44,19 @@ impl Default for Settings {
             dlink_ttl: 1800,
             allow_other: false,
             readonly: false,
+            sync_root: default_sync_root(),
         }
+    }
+}
+
+/// Windows 同步根默认 %USERPROFILE%\BaiduNetdisk(英文,避开老程序中文路径兼容问题)
+fn default_sync_root() -> String {
+    match std::env::var_os("USERPROFILE") {
+        Some(up) => std::path::PathBuf::from(up)
+            .join("BaiduNetdisk")
+            .to_string_lossy()
+            .into_owned(),
+        None => "BaiduNetdisk".into(),
     }
 }
 

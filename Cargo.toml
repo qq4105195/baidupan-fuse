@@ -10,14 +10,24 @@ license = "MIT"
 name = "bdfs"
 path = "src/main.rs"
 
-# FUSE 用户态文件系统
-# Linux:关掉默认的 libfuse feature,走纯 Rust 挂载实现(不依赖系统 libfuse);
-# macOS:libfuse feature 会通过 pkg-config 找 macFUSE/FUSE-T,保持默认
+# FUSE 用户态文件系统(Linux/macOS;Windows 不用 FUSE,走 Cloud Files API 见 src/win/)
+# Linux:关掉默认的 libfuse feature,走纯 Rust 挂载实现(不依赖系统 libfuse)
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.15", default-features = false, features = ["abi-7-28"] }
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+# macOS:libfuse feature 会通过 pkg-config 找 macFUSE/FUSE-T,保持默认
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
 fuser = "0.15"
+
+# Unix 专用:errno 常量、信号/umount(菜单卸载、fs 错误映射)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows 专用:Cloud Files API 绑定(OneDrive 式按需文件夹)+ 优雅退出 + 命名互斥/事件
+[target.'cfg(windows)'.dependencies]
+cloud-filter = "0.0.6"
+ctrlc = "3"
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }
 
 [dependencies]
 # HTTP 客户端,blocking 模式(fuser 的 Filesystem 是同步 trait,不需要 tokio)
@@ -28,7 +38,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

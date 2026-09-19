@@ -1,22 +1,30 @@
-//! bdfs:百度网盘 FUSE 挂载工具(Linux/macOS),支持读 + 写(close 时三段式上传)。
+//! bdfs:百度网盘挂载/同步工具。
+//! - Linux/macOS:FUSE 挂载(fuser,读 + 写,close 时三段式上传)
+//! - Windows:OneDrive 式按需文件夹(Cloud Files API,云图标占位/打开即下载/
+//!   始终保留在此设备,见 src/win/)
 //! 裸跑(不带子命令)进交互控制台,子命令供脚本使用。
 
 mod baidu;
+#[cfg(unix)]
 mod fs;
 mod menu;
 mod progress;
 mod settings;
+#[cfg(windows)]
+mod win;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+#[cfg(unix)]
 use fuser::MountOption;
+#[cfg(unix)]
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
     name = "bdfs",
     version,
-    about = "百度网盘 FUSE 挂载(开放平台 API + fuser);不带子命令进入交互控制台"
+    about = "百度网盘挂载:FUSE(Linux/macOS)/ 按需文件夹(Windows);不带子命令进入交互控制台"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,6 +53,7 @@ enum Cmd {
         path: String,
     },
     /// 挂载到本地目录(Ctrl-C 退出后用 fusermount -u 卸载)
+    #[cfg(unix)]
     Mount {
         /// 本地挂载点
         mountpoint: PathBuf,
@@ -141,6 +150,7 @@ fn main() -> Result<()> {
                 );
             }
         }
+        #[cfg(unix)]
         Cmd::Mount {
             mountpoint,
             root,
@@ -168,7 +178,7 @@ fn main() -> Result<()> {
                 MountOption::FSName("bdfs".into()),
                 MountOption::Subtype("baidupan".into()),
                 // 默认读写;--read-only 让写操作在内核层就被拒绝(应用拿到 EROFS)
-                // 注:内核 attr 缓存时长由我们在 reply.entry/attr 里返回的 TTL 驱动
+                // 注:内核 attr 缓存时长由我们在 reply.entry/attr 里返回的 TTL 决定
             ];
             // 挂载进程退出时自动卸载,避免留下访问不了的挂载点。
             // AutoUnmount 依赖 fusermount 二进制,没有时(如 Android)跳过,
