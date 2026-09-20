@@ -53,6 +53,15 @@ enum Cmd {
         /// 远端目录,默认根目录
         path: String,
     },
+    /// 启动 Windows 按需同步(前台运行,自动注册同步根,Ctrl-C 退出)
+    #[cfg(windows)]
+    Sync {
+        /// 同步根目录(默认 %USERPROFILE%\BaiduNetdisk)
+        sync_root: Option<String>,
+    },
+    /// 注销 Windows 同步根(Explorer 恢复普通文件夹;本地文件保留)
+    #[cfg(windows)]
+    Unregister,
     /// 挂载到本地目录(Ctrl-C 退出后用 fusermount -u 卸载)
     #[cfg(unix)]
     Mount {
@@ -151,6 +160,16 @@ fn main() -> Result<()> {
                 );
             }
         }
+        #[cfg(windows)]
+        Cmd::Sync { sync_root } => {
+            let mut st = settings::Settings::load();
+            if let Some(sr) = sync_root {
+                st.sync_root = sr;
+            }
+            win::run(&st)?;
+        }
+        #[cfg(windows)]
+        Cmd::Unregister => win::unregister()?,
         #[cfg(unix)]
         Cmd::Mount {
             mountpoint,

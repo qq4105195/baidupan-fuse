@@ -44,3 +44,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 lto = true
 strip = true
+
+# cloud-filter 0.0.6 打了两个本地补丁(失败应答 Buffer 置空、回调失败不 unwrap 杀进程),
+# 见 vendor/cloud-filter/PATCHES.md;上游修了再撤
+[patch.crates-io]
+cloud-filter = { path = "vendor/cloud-filter" }
