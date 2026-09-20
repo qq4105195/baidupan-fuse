@@ -27,7 +27,7 @@ pub fn autostart_status() -> String {
 pub fn print_items() {
     println!("  3. 同步        启动按需文件夹,前台运行,Ctrl-C 退出");
     println!("  4. 停止同步");
-    println!("  5. 开机自动同步(注册表 Run 键)");
+    println!("  5. 开机自动同步(登录启动托盘,托盘自动带起同步)");
     println!("  6. 取消自动同步");
     println!("  7. 设置        同步根/远端根目录/缓存");
 }
@@ -40,7 +40,7 @@ pub fn dispatch(choice: &str, st: &Settings) {
             }
         }
         "4" => stop(st),
-        "5" => install_autostart(st),
+        "5" => install_autostart(),
         "6" => remove_autostart(),
         "7" => configure(),
         _ => unreachable!("菜单 3-7 由共享骨架过滤后才进来"),
@@ -56,20 +56,10 @@ fn stop(st: &Settings) {
     }
 }
 
-fn install_autostart(st: &Settings) {
-    let Ok(exe) = std::env::current_exe() else {
-        println!("拿不到自己的可执行文件路径");
-        return;
-    };
-    let cmd = format!("\"{}\" sync \"{}\"", exe.display(), st.sync_root);
-    match std::process::Command::new("reg")
-        .args(["add", RUN_KEY, "/v", RUN_NAME, "/t", "REG_SZ", "/d", &cmd, "/f"])
-        .status()
-    {
-        Ok(s) if s.success() => {
-            println!("开机自动同步已启用(登录后启动:{cmd})。");
-        }
-        r => println!("reg add 失败:{r:?}"),
+fn install_autostart() {
+    match autostart_enable() {
+        Ok(cmd) => println!("开机自动同步已启用(登录后启动托盘:{cmd})。"),
+        Err(e) => println!("启用失败:{e:#}"),
     }
 }
 
@@ -78,16 +68,45 @@ fn remove_autostart() {
         println!("没有配置过自启。");
         return;
     }
-    match std::process::Command::new("reg")
-        .args(["delete", RUN_KEY, "/v", RUN_NAME, "/f"])
-        .status()
-    {
-        Ok(s) if s.success() => println!("已取消开机自动同步。"),
-        r => println!("reg delete 失败:{r:?}"),
+    match autostart_disable() {
+        Ok(()) => println!("已取消开机自动同步。"),
+        Err(e) => println!("取消失败:{e:#}"),
     }
 }
 
-fn autostart_exists() -> bool {
+/// 写 Run 键:登录后启动托盘(托盘自动带起同步)。纯注册表操作无打印——
+/// 托盘进程脱离控制台后也要能调。返回写入的命令串供控制台回显
+pub(crate) fn autostart_enable() -> anyhow::Result<String> {
+    let exe = std::env::current_exe()?;
+    let cmd = format!("\"{}\" tray", exe.display());
+    let ok = std::process::Command::new("reg")
+        .args(["add", RUN_KEY, "/v", RUN_NAME, "/t", "REG_SZ", "/d", &cmd, "/f"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("启动 reg 失败:{e}"))?
+        .success();
+    if ok {
+        Ok(cmd)
+    } else {
+        anyhow::bail!("reg add 失败(退出码非 0)")
+    }
+}
+
+/// 删 Run 键(纯操作无打印,理由同上)
+pub(crate) fn autostart_disable() -> anyhow::Result<()> {
+    let ok = std::process::Command::new("reg")
+        .args(["delete", RUN_KEY, "/v", RUN_NAME, "/f"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("启动 reg 失败:{e}"))?
+        .success();
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!("reg delete 失败(退出码非 0)")
+    }
+}
+
+pub(crate) fn autostart_exists() -> bool {
+    // 值不存在时 reg query 退出码非 0(本机实测过),status 判定足够
     std::process::Command::new("reg")
         .args(["query", RUN_KEY, "/v", RUN_NAME])
         .output()
@@ -96,7 +115,7 @@ fn autostart_exists() -> bool {
 }
 
 /// 设置:Windows 只问同步相关项(块大小/缓存等是 FUSE 概念)
-fn configure() {
+pub(crate) fn configure() {
     let mut st = Settings::load();
     println!("-- 设置(回车 = 保持当前值)--");
     let Some(sr) = ask_default("同步根目录(改了要重新注册,原根先停止同步)", Some(&st.sync_root))

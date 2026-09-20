@@ -122,6 +122,9 @@ Windows 不走 FUSE,用系统的 **Cloud Files API(cldapi)**——和 OneDrive �
 
 「3. 同步」= `bdfs sync`(可带参数指定同步根):注册同步根(默认
 `%USERPROFILE%\BaiduNetdisk`,Explorer 侧边栏出现「百度网盘」)后前台常驻。
+日常使用更省事的入口是**托盘**:`bdfs tray` 右下角常驻图标(自动带起同步),
+右键菜单 = 打开网盘文件夹 / 开关同步 / 开机自启勾选 / 设置 / 传输进度 / 退出,
+全程不用开终端;同步进程的输出落在 `%APPDATA%\baidupan-fuse\sync.log`。
 之后:
 
 - 文件夹里的文件都是**云图标占位符**(不占磁盘),双击 = 整文件下载后打开,
@@ -132,7 +135,8 @@ Windows 不走 FUSE,用系统的 **Cloud Files API(cldapi)**——和 OneDrive �
   30s→1m→10m→30m→1h 退避重试,重启进程会启动脏扫补传)
 - 单实例保护:第二个 `bdfs sync` 直接提示退出;菜单「4. 停止同步」或 Ctrl-C
   优雅断开(**不注销**:进程不在时占位符仍可见,只是打不开)
-- 「5. 开机自动同步」写 HKCU Run 键(指向当前 exe,把 exe 挪位置前先取消)
+- 「5. 开机自动同步」写 HKCU Run 键,登录后启动**托盘**(托盘再自动带起同步;
+  把 exe 挪位置前先取消)
 
 凭据在 `%APPDATA%\baidupan-fuse\`(和 Linux 的 `~/.config/baidupan-fuse/` 同构,
 config.json + token.json 可以直接拷贝过去免重新授权)。

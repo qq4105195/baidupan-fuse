@@ -10,11 +10,13 @@
 //! - provider.rs   WinProvider:cloud_filter SyncFilter 回调实现
 //! - hydrate.rs    fetch_data 水合管线(分块下载 + 取消)(M3)
 //! - syncback.rs   本地变更回传队列(防抖/重试/自触抑制)(M4)
+//! - tray.rs       系统托盘:管理隐藏 sync 子进程的日常入口(M6)
 
 mod hydrate;
 mod identity;
 mod provider;
 mod syncback;
+pub(crate) mod tray;
 
 use crate::settings::Settings;
 use anyhow::{anyhow, Result};
@@ -28,7 +30,7 @@ const SINGLE_MUTEX: &str = r"Local\bdfs-sync-single";
 const STOP_EVENT: &str = r"Local\bdfs-sync-stop";
 
 /// UTF-16 + 结尾 NUL(windows-sys 的 PCWSTR 要这种)
-fn wstr(s: &str) -> Vec<u16> {
+pub(crate) fn wstr(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -242,4 +244,19 @@ fn stop_impl() -> bool {
 /// 通知正在跑的同步进程退出(命名事件);返回是否有进程被通知。
 pub fn stop(_sync_root: &str) -> bool {
     stop_impl()
+}
+
+/// 是否有同步进程在跑(OpenMutexW 探单实例互斥——互斥从进程启动就持有,
+/// 比停止事件准:事件要到 Session::connect 之后才建,有盲区。
+/// OpenMutexW 只开不建,绝不会误持有、挡住后续启动)
+pub(crate) fn sync_running() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::OpenMutexW;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    let m = unsafe { OpenMutexW(SYNCHRONIZE, 0, wstr(SINGLE_MUTEX).as_ptr()) };
+    if m.is_null() {
+        return false;
+    }
+    unsafe { CloseHandle(m) };
+    true
 }

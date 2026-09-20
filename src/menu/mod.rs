@@ -123,8 +123,32 @@ fn info() {
 
 // ---------- 小工具(平台子模块共用) ----------
 
+/// bdfs config 子命令入口:托盘「设置…」用 CREATE_NEW_CONSOLE 拉起的交互流
+#[cfg(windows)]
+pub(crate) fn configure() {
+    windows::configure();
+}
+
+/// 自启 Run 键是否存在(托盘勾选项初始态用)
+#[cfg(windows)]
+pub(crate) fn autostart_exists() -> bool {
+    windows::autostart_exists()
+}
+
+/// 写自启 Run 键(纯注册表操作无打印——托盘脱离控制台后也要能调)
+#[cfg(windows)]
+pub(crate) fn autostart_enable() -> anyhow::Result<String> {
+    windows::autostart_enable()
+}
+
+/// 删自启 Run 键(同上,纯操作)
+#[cfg(windows)]
+pub(crate) fn autostart_disable() -> anyhow::Result<()> {
+    windows::autostart_disable()
+}
+
 /// 下载进度:读挂载/同步进程写的 progress.json
-fn progress_view() {
+pub(crate) fn progress_view() {
     use crate::progress::ProgressFile;
     let p = baidu::config_dir().join("progress.json");
     let raw = match std::fs::read_to_string(&p) {

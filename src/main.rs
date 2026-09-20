@@ -59,6 +59,15 @@ enum Cmd {
         /// 同步根目录(默认 %USERPROFILE%\BaiduNetdisk)
         sync_root: Option<String>,
     },
+    /// 启动系统托盘(右下角图标:开关同步/自启/设置/进度;自动带起同步,日常入口)
+    #[cfg(windows)]
+    Tray,
+    /// 交互式设置(托盘「设置…」在新控制台窗口里跑的就是它)
+    #[cfg(windows)]
+    Config,
+    /// 显示传输进度,按回车退出(托盘「传输进度…」用;也可手动跑)
+    #[cfg(windows)]
+    Progress,
     /// 注销 Windows 同步根(Explorer 恢复普通文件夹;本地文件保留)
     #[cfg(windows)]
     Unregister,
@@ -109,8 +118,7 @@ fn main() -> Result<()> {
     let cmd = match cli.cmd {
         None => return menu::run(),
         Some(c) => c,
-    };
-    match cmd {
+    };    match cmd {
         Cmd::Login {
             app_key,
             app_secret,
@@ -167,6 +175,15 @@ fn main() -> Result<()> {
                 st.sync_root = sr;
             }
             win::run(&st)?;
+        }
+        #[cfg(windows)]
+        Cmd::Tray => win::tray::run(&settings::Settings::load())?,
+        #[cfg(windows)]
+        Cmd::Config => menu::configure(),
+        #[cfg(windows)]
+        Cmd::Progress => {
+            menu::progress_view();
+            pause_before_exit();
         }
         #[cfg(windows)]
         Cmd::Unregister => win::unregister()?,
@@ -246,4 +263,13 @@ fn humansize(n: u64) -> String {
     } else {
         format!("{v:.1} {}", unit[i])
     }
+}
+
+/// 托盘「传输进度…」拉起的新控制台窗口里跑完别闪退:等一个回车。
+/// 刻意 cfg(windows) 只服务托盘;unix 下加无条件暂停会毁脚本管道
+#[cfg(windows)]
+fn pause_before_exit() {
+    use std::io::BufRead;
+    println!("按回车退出…");
+    let _ = std::io::stdin().lock().read_line(&mut String::new());
 }
