@@ -43,9 +43,21 @@ enum SyncState {
 
 /// 托盘入口:单实例 → 建 UI(还在控制台上,报错可见)→ 脱离控制台 →
 /// 自动带起同步 → 消息循环。次序承重,别调换。
-pub(crate) fn run(st: &Settings) -> anyhow::Result<()> {
+///
+/// `quiet = false`(手点/双击桌面图标):开一个资源管理器窗口到同步根——
+/// OneDrive 式语义,双击桌面图标永远"打开网盘";托盘已在跑也一样。
+/// `quiet = true`(登录自启):只起托盘,别每次登录都弹文件夹。
+pub(crate) fn run(st: &Settings, quiet: bool) -> anyhow::Result<()> {
     let sync_root = super::resolve_sync_root(&st.sync_root);
-    claim_tray_instance()?;
+    let first = claim_tray_instance()?;
+    if !quiet {
+        // explorer 即使成功也常返回 1,忽略状态
+        let _ = Command::new("explorer").arg(&sync_root).spawn();
+    }
+    if !first {
+        // 已有托盘:开完文件夹就退(这就是"双击打不开"的正解——不是失败)
+        return Ok(());
+    }
     let ui = TrayUi::build()?;
     println!("bdfs 托盘已启动(右键图标操作,退出用托盘菜单)。");
     println!("同步日志:%APPDATA%\\baidupan-fuse\\sync.log");
@@ -396,17 +408,18 @@ fn tray_log(line: &str) {
     }
 }
 
-/// 托盘单实例(命名互斥;报错在 FreeConsole 前打,用户看得见)
-fn claim_tray_instance() -> anyhow::Result<()> {
+/// 托盘单实例(命名互斥)。false = 已经有一个在跑(不是错误,见 run);
+/// 报错在 FreeConsole 前打,用户看得见
+fn claim_tray_instance() -> anyhow::Result<bool> {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::Threading::CreateMutexW;
     let m = unsafe { CreateMutexW(std::ptr::null(), 0, wstr(TRAY_MUTEX).as_ptr()) };
     if !m.is_null() && unsafe { GetLastError() } == 183 {
-        anyhow::bail!("托盘已在运行(单实例保护),右下角找图标。");
+        return Ok(false);
     }
     if m.is_null() {
         anyhow::bail!("建托盘互斥失败:{}", std::io::Error::last_os_error());
     }
     // 句柄故意不 CloseHandle(裸指针无 RAII,不关即持有),进程退出系统回收
-    Ok(())
+    Ok(true)
 }

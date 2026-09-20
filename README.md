@@ -126,6 +126,8 @@ Windows 不走 FUSE,用系统的 **Cloud Files API(cldapi)**——和 OneDrive �
 日常使用更省事的入口是**托盘**:`bdfs tray` 右下角常驻图标(自动带起同步),
 右键菜单 = 打开网盘文件夹 / 开关同步 / 开机自启勾选 / 设置 / 传输进度 / 退出,
 全程不用开终端;同步进程的输出落在 `%APPDATA%\baidupan-fuse\sync.log`。
+**桌面快捷方式指向 `bdfs tray`**:双击 = 打开网盘文件夹(OneDrive 语义——
+托盘没跑就顺手带起;已在跑就只开文件夹,不会报错闪退)。
 
 「设置…」(同 `bdfs config`)弹的是原生设置窗口,不用敲命令:
 
@@ -146,8 +148,8 @@ Windows 不走 FUSE,用系统的 **Cloud Files API(cldapi)**——和 OneDrive �
   30s→1m→10m→30m→1h 退避重试,重启进程会启动脏扫补传)
 - 单实例保护:第二个 `bdfs sync` 直接提示退出;菜单「4. 停止同步」或 Ctrl-C
   优雅断开(**不注销**:进程不在时占位符仍可见,只是打不开)
-- 「5. 开机自动同步」写 HKCU Run 键,登录后启动**托盘**(托盘再自动带起同步;
-  把 exe 挪位置前先取消)
+- 「5. 开机自动同步」写 HKCU Run 键,登录后**静默**启动**托盘**(--quiet,
+  不弹文件夹;托盘再自动带起同步;把 exe 挪位置前先取消)
 
 凭据在 `%APPDATA%\baidupan-fuse\`(和 Linux 的 `~/.config/baidupan-fuse/` 同构,
 config.json + token.json 可以直接拷贝过去免重新授权)。

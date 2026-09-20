@@ -78,11 +78,11 @@ fn remove_autostart() {
     }
 }
 
-/// 写 Run 键:登录后启动托盘(托盘自动带起同步)。纯注册表操作无打印——
-/// 托盘进程脱离控制台后也要能调。返回写入的命令串供控制台回显
+/// 写 Run 键:登录后静默启动托盘(--quiet 不弹文件夹),托盘自动带起同步。
+/// 纯注册表操作无打印——托盘进程脱离控制台后也要能调。返回写入的命令串供控制台回显
 pub(crate) fn autostart_enable() -> anyhow::Result<String> {
     let exe = std::env::current_exe()?;
-    let cmd = format!("\"{}\" tray", exe.display());
+    let cmd = format!("\"{}\" tray --quiet", exe.display());
     let ok = std::process::Command::new("reg")
         .args(["add", RUN_KEY, "/v", RUN_NAME, "/t", "REG_SZ", "/d", &cmd, "/f"])
         .status()

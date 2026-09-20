@@ -59,9 +59,15 @@ enum Cmd {
         /// 同步根目录(默认 %USERPROFILE%\BaiduNetdisk)
         sync_root: Option<String>,
     },
-    /// 启动系统托盘(右下角图标:开关同步/自启/设置/进度;自动带起同步,日常入口)
+    /// 启动系统托盘(右下角图标:开关同步/自启/设置/进度;自动带起同步,日常入口)。
+    /// 双击桌面图标 = 打开网盘文件夹(托盘没跑就顺手带起);--quiet 供开机自启,
+    /// 只起托盘不弹文件夹
     #[cfg(windows)]
-    Tray,
+    Tray {
+        /// 静默启动(开机自启用):不弹资源管理器窗口
+        #[arg(long)]
+        quiet: bool,
+    },
     /// 打开设置窗口(托盘「设置…」弹的就是它;保存后同步自动重启生效)
     #[cfg(windows)]
     Config,
@@ -177,7 +183,7 @@ fn main() -> Result<()> {
             win::run(&st)?;
         }
         #[cfg(windows)]
-        Cmd::Tray => win::tray::run(&settings::Settings::load())?,
+        Cmd::Tray { quiet } => win::tray::run(&settings::Settings::load(), quiet)?,
         #[cfg(windows)]
         Cmd::Config => win::config_gui::run()?,
         #[cfg(windows)]
