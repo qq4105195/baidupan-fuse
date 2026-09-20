@@ -23,6 +23,15 @@ use std::path::{Path, PathBuf};
 /// 同步根提供方标识(SyncRootId 的第一段,格式 bdfs!<用户SID>!<账号>)
 pub const PROVIDER: &str = "bdfs";
 
+/// 单实例互斥 / 停止事件名(Local\ 会话命名空间,每个用户一套)
+const SINGLE_MUTEX: &str = r"Local\bdfs-sync-single";
+const STOP_EVENT: &str = r"Local\bdfs-sync-stop";
+
+/// UTF-16 + 结尾 NUL(windows-sys 的 PCWSTR 要这种)
+fn wstr(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// 同步根是否已注册(Explorer 是否已认下这个提供方)
 pub fn is_registered(sync_root: &str) -> bool {
     let p = resolve_sync_root(sync_root);
@@ -38,6 +47,7 @@ pub fn run(st: &Settings) -> Result<()> {
     if !supported {
         anyhow::bail!("这台 Windows 不支持 Cloud Files API(需 Win10 1709+ / NTFS)");
     }
+    claim_single_instance()?;
     let sync_root = resolve_sync_root(&st.sync_root);
     std::fs::create_dir_all(&sync_root)?;
     register(&sync_root)?;
@@ -60,16 +70,57 @@ pub fn run(st: &Settings) -> Result<()> {
         .map_err(|e| anyhow!("连接同步根失败:{e}"))?;
     println!("按需同步运行中(双击/右键\"始终保留在此设备\"触发下载)。Ctrl-C 退出。");
 
-    // Ctrl-C / 控制台关闭 → 收到信号断开;ctrlc 在 Windows 上走 SetConsoleCtrlHandler
+    // Ctrl-C / 控制台关闭 → 收到信号断开;ctrlc 在 Windows 上走 SetConsoleCtrlHandler。
+    // 「停止同步」菜单/其它进程也往同一通道发(命名事件),谁先到都一样
     let (tx, rx) = std::sync::mpsc::channel::<()>();
-    ctrlc::set_handler(move || {
-        let _ = tx.send(());
+    ctrlc::set_handler({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(());
+        }
     })
     .map_err(|e| anyhow!("装 Ctrl-C 处理器失败:{e}"))?;
+    let stop_watcher = spawn_stop_watcher(tx);
     let _ = rx.recv();
     println!("正在断开(不注销,占位符保持可见)…");
+    drop(stop_watcher);
     drop(connection);
     Ok(())
+}
+
+/// 监听命名停止事件,触发时往 tx 发(与 Ctrl-C 同一通道);返回句柄 keep-alive
+fn spawn_stop_watcher(tx: std::sync::mpsc::Sender<()>) -> StopEvent {
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    let name = wstr(STOP_EVENT);
+    let evt = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+    if evt.is_null() {
+        tracing::warn!(
+            "建停止事件失败(菜单停止不可用,Ctrl-C 仍可):{}",
+            std::io::Error::last_os_error()
+        );
+        return StopEvent(std::ptr::null_mut());
+    }
+    // 句柄转 usize 带进等待线程(裸指针 !Send,usize 是普通整数)
+    let h = evt as usize;
+    std::thread::spawn(move || {
+        // INFINITE;进程退出时线程随进程销毁
+        unsafe { WaitForSingleObject(h as *mut core::ffi::c_void, 0xFFFF_FFFF) };
+        let _ = tx.send(());
+    });
+    StopEvent(evt)
+}
+
+/// 停止事件句柄包装(裸指针非 Send,包一层;空句柄=没建成,Ctrl-C 仍可用)。
+/// 主线程持有到退出前 drop:此时等待线程要么已醒(进程马上退出)要么被
+/// close 打断(WaitForSingleObject 返回失败,无害)
+struct StopEvent(*mut core::ffi::c_void);
+unsafe impl Send for StopEvent {}
+impl Drop for StopEvent {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
 }
 
 /// 注册同步根(幂等:已注册直接返回)。策略:
@@ -152,8 +203,43 @@ pub fn resolve_sync_root(s: &str) -> PathBuf {
     }
 }
 
+/// 单实例:命名互斥,第二个 `bdfs sync` 直接提示退出(两个提供方连同一个
+/// 同步根会互相打架,回调随机被其中一个抢走)。互斥句柄进程存活期间持有,
+/// 故意 leak(进程退出系统自动回收)
+fn claim_single_instance() -> Result<()> {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name = wstr(SINGLE_MUTEX);
+    let m = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    // ERROR_ALREADY_EXISTS(183):句柄有效但互斥已有人持有
+    if !m.is_null() && unsafe { GetLastError() } == 183 {
+        anyhow::bail!("同步已在运行(单实例保护)。要停掉它:菜单 4 停止同步,或 Ctrl-C 那个窗口。");
+    }
+    if m.is_null() {
+        // 建互斥失败不拦运行(极少见;事件/Ctrl-C 退出仍可用)
+        tracing::warn!("建单实例互斥失败:{}", std::io::Error::last_os_error());
+    }
+    // 持有互斥:句柄故意不 CloseHandle(裸指针无 RAII,不关即持有),
+    // 进程退出系统自动回收
+    Ok(())
+}
+
 /// 通知正在跑的同步进程退出;返回是否有进程被通知。
+fn stop_impl() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent};
+    const EVENT_MODIFY_STATE: u32 = 0x0002;
+    let name = wstr(STOP_EVENT);
+    let evt = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+    if evt.is_null() {
+        return false; // 事件不存在 = 没有同步进程在跑
+    }
+    let ok = unsafe { SetEvent(evt) } != 0;
+    unsafe { CloseHandle(evt) };
+    ok
+}
+
+/// 通知正在跑的同步进程退出(命名事件);返回是否有进程被通知。
 pub fn stop(_sync_root: &str) -> bool {
-    // M5:命名事件 Local\bdfs-sync-stop(注册自启 + 单实例一起做);当前恒 false
-    false
+    stop_impl()
 }

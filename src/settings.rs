@@ -40,12 +40,23 @@ impl Default for Settings {
             block_mb: 16,
             parallel: 1,
             cache_mb: 128,
-            dir_ttl: 60,
+            // Windows 按需文件夹的目录枚举会连片打 API(Explorer 一次浏览几十次
+            // 元数据查询),配额是生死线,默认 300;FUSE 侧沿用 60
+            dir_ttl: default_dir_ttl(),
             dlink_ttl: 1800,
             allow_other: false,
             readonly: false,
             sync_root: default_sync_root(),
         }
+    }
+}
+
+/// 目录列表缓存 TTL 默认:Windows(按需文件夹,枚举风暴敏感)300s,Unix 60s
+fn default_dir_ttl() -> u64 {
+    if cfg!(windows) {
+        300
+    } else {
+        60
     }
 }
 

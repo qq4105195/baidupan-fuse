@@ -94,7 +94,6 @@ impl WinProvider {
         let syncback = super::syncback::SyncBack::new(
             client.clone(),
             dir_cache.clone(),
-            dlink_cache.clone(),
             progress.clone(),
             sync_root.clone(),
             core::normalize_root(&st.root),

@@ -9,7 +9,9 @@ use crate::progress::Progress;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)] // remote_to_local 的返回类型,unix 侧不用
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -47,6 +49,7 @@ pub fn normalize_root(root: &str) -> String {
 
 /// 本地同步根下的路径 → 远端绝对路径(相对部分同构挂在 root 下)。
 /// 返回 None:local 不在 sync_root 下。Windows 磨掉路径大小写差异。
+#[cfg(windows)]
 pub fn local_to_remote(local: &Path, sync_root: &Path, root: &str) -> Option<String> {
     let rel = rel_under(local, sync_root)?;
     let root = normalize_root(root);
@@ -58,6 +61,7 @@ pub fn local_to_remote(local: &Path, sync_root: &Path, root: &str) -> Option<Str
 }
 
 /// 远端绝对路径 → 本地同步根下的路径(root 之下的相对部分同构映射回去)
+#[cfg(windows)]
 pub fn remote_to_local(remote: &str, root: &str, sync_root: &Path) -> PathBuf {
     let root = normalize_root(root);
     let rel = remote.strip_prefix(&root).unwrap_or(remote).trim_start_matches('/');
@@ -70,6 +74,7 @@ pub fn remote_to_local(remote: &str, root: &str, sync_root: &Path) -> PathBuf {
 
 /// local 相对 sync_root 的部分(统一 / 分隔,根本身返回空串)。
 /// 前缀比较忽略大小写(Windows 文件系统不区分),但保留原始大小写返回
+#[cfg(windows)]
 fn rel_under(local: &Path, sync_root: &Path) -> Option<String> {
     let l = local.to_string_lossy().replace('\\', "/");
     let r = sync_root.to_string_lossy().replace('\\', "/");
@@ -119,6 +124,8 @@ impl DirCache {
     }
 
     /// 拿一份可能过期的旧值:配额报错时兜底,别让已看过的目录整个消失
+    /// (仅 Windows 按需枚举用;FUSE 路径配额报错直接向上抛)
+    #[cfg(windows)]
     pub fn stale(&self, dir: &str) -> Option<Vec<NetFile>> {
         self.lock().get(dir).map(|(f, _)| f.clone())
     }

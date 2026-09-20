@@ -13,7 +13,7 @@
 //! 平台按注册的 InSyncPolicy 在真实写入时自动清 in_sync,这就是脏信号。
 
 use crate::baidu::NetFile;
-use crate::core::{self, DirCache, DLinkCache, SharedClient};
+use crate::core::{self, DirCache, SharedClient};
 use crate::progress::Progress;
 use cloud_filter::placeholder::Placeholder;
 use std::collections::{HashMap, HashSet};
@@ -77,7 +77,6 @@ impl SyncBack {
     pub fn new(
         client: Arc<SharedClient>,
         dir_cache: Arc<DirCache>,
-        dlink_cache: Arc<DLinkCache>,
         progress: Progress,
         sync_root: PathBuf,
         root: String,
@@ -96,7 +95,6 @@ impl SyncBack {
                     worker_handled,
                     client,
                     dir_cache,
-                    dlink_cache,
                     progress,
                     sync_root,
                     root,
@@ -182,7 +180,6 @@ struct Ctx {
     handled: Arc<Mutex<HashSet<PathBuf>>>,
     client: Arc<SharedClient>,
     dir_cache: Arc<DirCache>,
-    dlink_cache: Arc<DLinkCache>,
     progress: Progress,
     sync_root: PathBuf,
     root: String,
@@ -202,7 +199,6 @@ fn worker(
     handled: Arc<Mutex<HashSet<PathBuf>>>,
     client: Arc<SharedClient>,
     dir_cache: Arc<DirCache>,
-    dlink_cache: Arc<DLinkCache>,
     progress: Progress,
     sync_root: PathBuf,
     root: String,
@@ -212,7 +208,6 @@ fn worker(
         handled,
         client,
         dir_cache,
-        dlink_cache,
         progress,
         sync_root,
         root,

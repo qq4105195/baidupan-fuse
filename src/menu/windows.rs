@@ -47,7 +47,7 @@ pub fn dispatch(choice: &str, st: &Settings) {
     }
 }
 
-/// 停止同步:通知正在跑的同步进程(M5 实现命名事件前的占位提示)
+/// 停止同步:命名事件通知正在跑的同步进程(它走正常断开流程,不注销)
 fn stop(st: &Settings) {
     if crate::win::stop(&st.sync_root) {
         println!("已通知同步进程退出。");

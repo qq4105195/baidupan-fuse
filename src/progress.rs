@@ -131,6 +131,8 @@ impl Progress {
     }
 
     /// 卸载时清掉进度文件,别留下"永远进行中"的假条目
+    /// (只有 unix 的 mount/卸载路径用;Windows 同步常驻不卸载)
+    #[cfg(unix)]
     pub fn clear(&self) {
         let _ = std::fs::remove_file(&self.file);
     }

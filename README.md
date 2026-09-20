@@ -1,13 +1,17 @@
 # baidupan-fuse
 
-百度网盘 FUSE 挂载工具:把网盘目录树挂载成本地文件系统,支持读 + 写(Linux/macOS 通用,同一份代码)。
+百度网盘挂载工具,同一份代码两种形态:
+**Linux/macOS** 是 FUSE 挂载(读写),**Windows** 是 OneDrive 式按需文件夹
+(Cloud Files API:云图标占位、打开即下载、右键"始终保留在此设备"/"释放空间")。
 
 - 走 [百度网盘开放平台](https://pan.baidu.com/union/doc/) REST API(基础网盘服务)
-- `fuser` 实现用户态文件系统:Linux 纯 Rust 直连 `/dev/fuse`,无需 libfuse
+- Linux/macOS:`fuser` 实现用户态文件系统,Linux 纯 Rust 直连 `/dev/fuse`,无需 libfuse
 - 读:目录浏览、`cat`/`cp` 拉取、`df` 查容量
 - 写:改动先落本地暂存,close 时按官方三段式(precreate → 4MB 分片 superfile2 → create)
   传回网盘;mkdir/改名/删除/截断都支持。要挡写挂载时加 `--read-only`(内核层 EROFS)
-- 目录列表 / attr / dlink 三级内存缓存,应对 FUSE 的调用风暴和 API 配额限制
+- Windows:Explorer 侧边栏出现「百度网盘」,文件默认是云图标占位符,双击按需下载,
+  本地增删改改名自动回传网盘(防抖 + 失败退避重试)
+- 目录列表 / attr / dlink 三级内存缓存,应对调用风暴和 API 配额限制
 - 可部署到 Android 设备(实测中兴 F50 Pro 随身路由,root):网盘直接变成局域网
   SMB 共享,教程见 [docs/deploy-f50pro.md](docs/deploy-f50pro.md)
 
@@ -94,6 +98,57 @@ systemctl daemon-reload && systemctl enable --now bdfs
 
 日志:`RUST_LOG=debug bdfs mount ...` 看每次 API 拉取,排查限频很有用。
 
+## Windows:OneDrive 式按需文件夹
+
+Windows 不走 FUSE,用系统的 **Cloud Files API(cldapi)**——和 OneDrive 同一套机制。
+要求:Windows 10 1709+、同步根在 NTFS 盘、**无需管理员**(同步根注册进当前用户)。
+
+新机器同样是裸跑 `bdfs` 进控制台,菜单按平台自动切换:
+
+```
+════════════ bdfs ════════════
+凭据:已保存  同步:已注册(C:\Users\you\BaiduNetdisk)  自启:未配置
+──────────────────────────────
+  1. 登录授权    填 AppKey/SecretKey,浏览器拿授权码
+  2. 账号信息    验证登录、看容量
+  3. 同步        启动按需文件夹,前台运行,Ctrl-C 退出
+  4. 停止同步
+  5. 开机自动同步(注册表 Run 键)
+  6. 取消自动同步
+  7. 设置        同步根/远端根目录/缓存
+  8. 传输进度    挂载/同步进程正在/最近的下载与上传
+  0. 退出
+```
+
+「3. 同步」= `bdfs sync`(可带参数指定同步根):注册同步根(默认
+`%USERPROFILE%\BaiduNetdisk`,Explorer 侧边栏出现「百度网盘」)后前台常驻。
+之后:
+
+- 文件夹里的文件都是**云图标占位符**(不占磁盘),双击 = 整文件下载后打开,
+  进度显示在资源管理器弹窗;`bdfs` 控制台「8. 传输进度」也能看
+- 右键 **始终保留在此设备** = 后台全量下载(绿勾);右键 **释放空间** =
+  删本地内容回云图标(没回传完的改动会被拒绝,防止丢数据)
+- 本地新建/修改/改名/删除自动回传网盘(改动后 ~2s 防抖起传;失败按
+  30s→1m→10m→30m→1h 退避重试,重启进程会启动脏扫补传)
+- 单实例保护:第二个 `bdfs sync` 直接提示退出;菜单「4. 停止同步」或 Ctrl-C
+  优雅断开(**不注销**:进程不在时占位符仍可见,只是打不开)
+- 「5. 开机自动同步」写 HKCU Run 键(指向当前 exe,把 exe 挪位置前先取消)
+
+凭据在 `%APPDATA%\baidupan-fuse\`(和 Linux 的 `~/.config/baidupan-fuse/` 同构,
+config.json + token.json 可以直接拷贝过去免重新授权)。
+
+**Windows 专属边界**:
+
+- **配额比 Linux 更敏感**:Explorer 浏览目录时元数据查询是连片的,目录列表缓存
+  TTL 默认 **300s**(Linux 是 60s),别调小
+- 已展开过的目录**不会自动刷新**(cldapi 枚举一次性语义):在别的设备上传到网盘的
+  新文件,v1 里要重启同步进程才出现在已浏览过的目录里(没浏览过的目录浏览即拉新)
+- 远端在别处被删/改名,v1 不回推本地(「本地为主」语义;双向对比回推列在路线里)
+- `bdfs sync` 进程不在跑时:占位符可见、不能打开/水合;本地已全量下载的文件照常可用
+- 同步根不能是磁盘根目录/系统目录;杀软实时扫描可能触发隐式下载(代价认了,
+  拦它会把"始终保留在此设备"也误伤)
+- 崩溃残留的注册可用菜单外命令清干净:`bdfs unregister`(本地文件原样保留)
+
 ## 编译
 
 产物是静态二进制 `target/release/bdfs`(musl,目标机器零依赖)。
@@ -102,6 +157,9 @@ systemctl daemon-reload && systemctl enable --now bdfs
   ```bash
   cargo build --release --target aarch64-unknown-linux-musl   # 或 x86_64
   ```
+- Windows:MSVC 工具链直接 `cargo build --release`(cldapi 绑定是纯 FFI,
+  无系统 SDK 额外要求);产物 `target\release\bdfs.exe`。aarch64 Linux 交叉
+  编译见 [docs/deploy-f50pro.md](docs/deploy-f50pro.md)(zigbuild)
 - macOS:需要先装 [macFUSE](https://github.com/macos-fuse-t/macfuse)(kext)或 [FUSE-T](https://www.fuse-t.org/)(免 kext)
 - 想用 Docker 一把梭(开发机无 Rust 环境时):
   ```bash
@@ -117,17 +175,25 @@ src/
 ├─ baidu.rs      API 客户端:OAuth 设备码登录/token 刷新、list、filemetas(dlink)、
 │                Range 下载、quota;三段式上传(precreate/superfile2/create)、
 │                mkdir/filemanager(delete/move);errno → ApiError,fs 层 downcast 决定内核 errno
-├─ fs.rs         PanFs:fuser 的 Filesystem trait 实现。ino↔path 双向表、
+├─ core.rs       平台无关内核(自 fs.rs 抽取):SharedClient 锁策略、Dir/DLink TTL 缓存、
+│                Range 拉取重试、三段式上传编排、本地↔远端路径映射;FUSE 和 cldapi 共用
+├─ fs.rs         PanFs:fuser 的 Filesystem trait 实现(unix)。ino↔path 双向表、
 │                目录/dlink TTL 缓存、块缓存+预读梯度;
 │                写路径 = WriteSession 本地暂存 + close 时三段式上传
 │                (写洞回填旧数据、覆盖/改名/删除/截断、秒传)
-├─ settings.rs   控制台的持久化设置(~/.config/baidupan-fuse/settings.json),
-│                挂载和 systemd 服务生成都以它为准
-├─ progress.rs   传输进度:挂载进程实时写 progress.json(原子写+节流),
+├─ settings.rs   控制台的持久化设置(unix ~/.config、Windows %APPDATA%),挂载/同步/
+│                systemd 服务/注册表自启都以它为准
+├─ progress.rs   传输进度:常驻进程实时写 progress.json(原子写+节流),
 │                下载分块和上传分片都走这套,控制台「8. 传输进度」读同一个文件
-├─ menu.rs       交互控制台:裸跑进入。登录/信息/挂载/卸载/自启/设置/进度,
-│                卸载靠扫 /proc 找挂载进程(比 pkill -f 安全)
-└─ main.rs       clap CLI:裸跑 → 控制台;子命令 login / info / ls / mount
+├─ menu/         交互控制台:裸跑进入。共享骨架(登录/信息/设置/进度)+ 按平台菜单项
+│                (unix:挂载/卸载/systemd 自启;windows:同步/停止/注册表自启/注销)
+├─ win/          Windows 形态(Cloud Files API,全部 cfg(windows)):
+│                mod.rs 同步根注册/生命周期/单实例互斥/停止事件;identity.rs 占位符
+│                blob 编码(fs_id/size/mtime);provider.rs SyncFilter 回调
+│                (枚举/删除/改名/脱水);hydrate.rs 按需下载管线(并发限 3+取消);
+│                syncback.rs 本地变更回传(watcher+防抖队列+退避重试+自触抑制)
+└─ main.rs       clap CLI:裸跑 → 控制台;子命令 login / info / ls / mount(unix)、
+                 sync / unregister(windows)
 ```
 
 关键取舍:
@@ -175,4 +241,7 @@ src/
 2. ✅ 块级读缓存 + 预读梯度(160KB/s → 4-7MB/s,单流策略对齐 SVIP 高速通道)
 3. ✅ 写支持:本地暂存 + close 时 precreate → superfile2(4MB 分片)→ create,
    覆盖/改名/删除/截断齐全,上传进度复用 progress.json(60MB 实测 md5 一致)
-4. ⬜ macOS 打包验证(macFUSE / FUSE-T)
+4. ✅ Windows 按需文件夹(Cloud Files API):云图标占位/双击水合(断点续传)/
+   pin-unpin/本地增删改改名回传/脏扫兜底;FUSE 路径不受影响
+5. ⬜ 远端改动回推(双向 fs_id/mtime 对比;Windows 已展开目录的重新枚举)
+6. ⬜ macOS 打包验证(macFUSE / FUSE-T)
