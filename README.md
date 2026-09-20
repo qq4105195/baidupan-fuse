@@ -10,7 +10,8 @@
 - 写:改动先落本地暂存,close 时按官方三段式(precreate → 4MB 分片 superfile2 → create)
   传回网盘;mkdir/改名/删除/截断都支持。要挡写挂载时加 `--read-only`(内核层 EROFS)
 - Windows:Explorer 侧边栏出现「百度网盘」,文件默认是云图标占位符,双击按需下载,
-  本地增删改改名自动回传网盘(防抖 + 失败退避重试)
+  本地增删改改名自动回传网盘(防抖 + 失败退避重试);日常入口是系统托盘,
+  登录授权和设置都在托盘弹出的 GUI 窗口里完成
 - 目录列表 / attr / dlink 三级内存缓存,应对调用风暴和 API 配额限制
 - 可部署到 Android 设备(实测中兴 F50 Pro 随身路由,root):网盘直接变成局域网
   SMB 共享,教程见 [docs/deploy-f50pro.md](docs/deploy-f50pro.md)
@@ -115,7 +116,7 @@ Windows 不走 FUSE,用系统的 **Cloud Files API(cldapi)**——和 OneDrive �
   4. 停止同步
   5. 开机自动同步(注册表 Run 键)
   6. 取消自动同步
-  7. 设置        同步根/远端根目录/缓存
+  7. 设置        弹设置窗口(GUI):登录授权 + 同步参数
   8. 传输进度    挂载/同步进程正在/最近的下载与上传
   0. 退出
 ```
@@ -125,6 +126,16 @@ Windows 不走 FUSE,用系统的 **Cloud Files API(cldapi)**——和 OneDrive �
 日常使用更省事的入口是**托盘**:`bdfs tray` 右下角常驻图标(自动带起同步),
 右键菜单 = 打开网盘文件夹 / 开关同步 / 开机自启勾选 / 设置 / 传输进度 / 退出,
 全程不用开终端;同步进程的输出落在 `%APPDATA%\baidupan-fuse\sync.log`。
+
+「设置…」(同 `bdfs config`)弹的是原生设置窗口,不用敲命令:
+
+- **登录授权**区:填 AppKey/AppSecret(Secret 留空沿用已保存的)→「开始授权」
+  自动打开浏览器,同意后把页面显示的授权码粘回窗口点「完成授权」;
+  走授权码(oob)模式,和应用没开通设备码授权的 `login --code-mode` 同一条路
+- **同步设置**区:同步根(带「浏览…」选目录)/ 远端根目录 / 目录/直链缓存秒数;
+  「保存」后正在跑的同步会**自动重启生效**(托盘每 2s 对 settings.json 做指纹),
+  不用手动重启任何东西
+
 之后:
 
 - 文件夹里的文件都是**云图标占位符**(不占磁盘),双击 = 整文件下载后打开,
@@ -195,7 +206,9 @@ src/
 │                mod.rs 同步根注册/生命周期/单实例互斥/停止事件;identity.rs 占位符
 │                blob 编码(fs_id/size/mtime);provider.rs SyncFilter 回调
 │                (枚举/删除/改名/脱水);hydrate.rs 按需下载管线(并发限 3+取消);
-│                syncback.rs 本地变更回传(watcher+防抖队列+退避重试+自触抑制)
+│                syncback.rs 本地变更回传(watcher+防抖队列+退避重试+自触抑制);
+│                tray.rs 系统托盘(管理隐藏 sync 子进程);config_gui.rs 设置窗口
+│                (原生 Win32 对话框:登录授权 + 同步参数,保存自动重启同步)
 └─ main.rs       clap CLI:裸跑 → 控制台;子命令 login / info / ls / mount(unix)、
                  sync / unregister(windows)
 ```

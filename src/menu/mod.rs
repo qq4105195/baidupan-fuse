@@ -123,12 +123,6 @@ fn info() {
 
 // ---------- 小工具(平台子模块共用) ----------
 
-/// bdfs config 子命令入口:托盘「设置…」用 CREATE_NEW_CONSOLE 拉起的交互流
-#[cfg(windows)]
-pub(crate) fn configure() {
-    windows::configure();
-}
-
 /// 自启 Run 键是否存在(托盘勾选项初始态用)
 #[cfg(windows)]
 pub(crate) fn autostart_exists() -> bool {
@@ -232,7 +226,8 @@ fn ask(prompt: &str) -> Option<String> {
     ask_default(prompt, None)
 }
 
-/// 读正整数,输错重问,回车保持默认
+/// 读正整数,输错重问,回车保持默认(Windows 的设置走 GUI,只有 unix 问答用)
+#[cfg(unix)]
 fn ask_num(prompt: &str, default: u64) -> Option<u64> {
     loop {
         let s = ask_default(prompt, Some(&default.to_string()))?;

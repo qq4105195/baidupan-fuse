@@ -1,7 +1,6 @@
 //! 控制台 Windows 菜单项:3 启动按需同步 / 4 停止 / 5 开机自启(注册表 Run 键)/
-//! 6 取消自启 / 7 设置。同步本体在 crate::win(Cloud Files API 提供方)。
+//! 6 取消自启 / 7 设置(弹 GUI 窗口)。同步本体在 crate::win(Cloud Files API 提供方)。
 
-use super::{ask_default, ask_num};
 use crate::settings::Settings;
 
 /// HKCU Run 键里自启项的名字
@@ -42,7 +41,12 @@ pub fn dispatch(choice: &str, st: &Settings) {
         "4" => stop(st),
         "5" => install_autostart(),
         "6" => remove_autostart(),
-        "7" => configure(),
+        "7" => {
+            // 设置从 M7 起是原生 GUI 窗口(和控制台问答说再见)
+            if let Err(e) = crate::win::config_gui::run() {
+                println!("设置窗口失败:{e:#}");
+            }
+        }
         _ => unreachable!("菜单 3-7 由共享骨架过滤后才进来"),
     }
 }
@@ -112,36 +116,4 @@ pub(crate) fn autostart_exists() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-/// 设置:Windows 只问同步相关项(块大小/缓存等是 FUSE 概念)
-pub(crate) fn configure() {
-    let mut st = Settings::load();
-    println!("-- 设置(回车 = 保持当前值)--");
-    let Some(sr) = ask_default("同步根目录(改了要重新注册,原根先停止同步)", Some(&st.sync_root))
-    else {
-        return;
-    };
-    st.sync_root = sr;
-    let Some(root) = ask_default(
-        "远端根目录(未过审应用只能访问 /apps/<应用名>,挂全盘填 /)",
-        Some(&st.root),
-    ) else {
-        return;
-    };
-    st.root = root;
-    let Some(dt) = ask_num(
-        "目录列表缓存秒数(省 API 配额;未过审应用 10 次/小时,建议 300)",
-        st.dir_ttl,
-    ) else {
-        return;
-    };
-    st.dir_ttl = dt;
-    let Some(dlt) = ask_num("下载直链缓存秒数(官方 8 小时有效)", st.dlink_ttl) else {
-        return;
-    };
-    st.dlink_ttl = dlt;
-    if let Err(e) = st.save() {
-        println!("保存失败:{e:#}");
-    }
 }

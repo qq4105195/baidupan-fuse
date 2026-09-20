@@ -59,6 +59,7 @@ pub(crate) fn run(st: &Settings) -> anyhow::Result<()> {
         ui,
         sync_root,
         sync_root_setting: st.sync_root.clone(),
+        settings_fp: settings_fingerprint(),
     };
     if sync_running() {
         app.state = SyncState::External;
@@ -80,6 +81,8 @@ struct TrayApp {
     sync_root: PathBuf,
     /// 设置里的同步根串(stop() 的参数,留字段对齐将来按根区分事件)
     sync_root_setting: String,
+    /// 子进程拉起时的 settings.json 指纹(轮询对比发现变更就重启它)
+    settings_fp: u64,
 }
 
 impl TrayApp {
@@ -126,9 +129,10 @@ impl TrayApp {
                         .autostart
                         .set_checked(crate::menu::autostart_exists());
                 } else if ev.id == ID_CONFIG {
-                    spawn_console_sub("config");
+                    // 设置是 GUI 窗口,别带控制台(否则会闪一个黑框)
+                    spawn_sub("config", false);
                 } else if ev.id == ID_PROGRESS {
-                    spawn_console_sub("progress");
+                    spawn_sub("progress", true);
                 } else if ev.id == ID_QUIT {
                     self.stop_ours_graceful();
                     break 'outer;
@@ -136,6 +140,17 @@ impl TrayApp {
             }
             if last_poll.elapsed() >= POLL {
                 self.refresh_status();
+                // 设置文件变了 → 优雅重启子进程吃新配置(设置窗口保存后自动生效;
+                // 只管自己拉起的,外部同步让主人自己重启)
+                if matches!(self.state, SyncState::Ours(_)) {
+                    let fp = settings_fingerprint();
+                    if fp != self.settings_fp {
+                        tray_log("settings.json 变更,重启同步子进程");
+                        self.stop_clicked();
+                        self.start_sync();
+                        self.paint_status();
+                    }
+                }
                 last_poll = Instant::now();
             }
             std::thread::sleep(Duration::from_millis(150));
@@ -148,7 +163,11 @@ impl TrayApp {
             return;
         }
         match spawn_sync() {
-            Ok(c) => self.state = SyncState::Ours(c),
+            Ok(c) => {
+                self.state = SyncState::Ours(c);
+                // 子进程自己 Settings::load,指纹按"它即将读到的"为准
+                self.settings_fp = settings_fingerprint();
+            }
             Err(e) => tray_log(&format!("起同步子进程失败:{e}")),
         }
     }
@@ -336,16 +355,31 @@ fn spawn_sync() -> std::io::Result<Child> {
         .spawn()
 }
 
-/// 托盘弹新控制台窗口跑子命令(设置/进度;窗口由子命令自己收尾)
-fn spawn_console_sub(sub: &str) {
+/// 托盘拉子命令:设置是 GUI 窗口(不带控制台,免闪黑框);进度仍是控制台窗口
+fn spawn_sub(sub: &str, console: bool) {
     use std::os::windows::process::CommandExt;
+    let flags = if console {
+        CREATE_NEW_CONSOLE
+    } else {
+        CREATE_NO_WINDOW
+    };
     let r = Command::new(std::env::current_exe().unwrap_or_default())
         .arg(sub)
-        .creation_flags(CREATE_NEW_CONSOLE)
+        .creation_flags(flags)
         .spawn();
     if let Err(e) = r {
         tray_log(&format!("拉起 bdfs {sub} 失败:{e}"));
     }
+}
+
+/// settings.json 内容指纹:设置窗口保存后托盘发现变更,自动重启同步生效
+fn settings_fingerprint() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::fs::read(crate::baidu::config_dir().join("settings.json"))
+        .unwrap_or_default()
+        .hash(&mut h);
+    h.finish()
 }
 
 /// 托盘没有 stdout(FreeConsole 后 println 会 panic),出错追加写这

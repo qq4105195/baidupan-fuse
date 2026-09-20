@@ -245,22 +245,16 @@ pub fn device_login(app_key: &str, app_secret: &str) -> Result<Token> {
     bail!("等待授权超时,请重新 login")
 }
 
-/// 授权码模式(oob)登录:应用没开通设备码授权时的替代方案。
-/// 打印授权网址,用户浏览器登录并同意后,页面会显示授权码,
-/// 把码从 stdin 传进来换 token。
-pub fn authcode_login(app_key: &str, app_secret: &str) -> Result<Token> {
-    let url = format!(
-        "{OPEN_HOST}/oauth/2.0/authorize?response_type=code&client_id={app_key}\
-         &redirect_uri=oob&scope=basic,netdisk"
-    );
-    println!("== 百度账号授权(授权码模式)==");
-    println!("浏览器打开: {url}");
-    println!("登录并同意授权后,页面会显示授权码,粘贴到这里回车:");
+/// 授权码模式(oob)的授权网址:浏览器打开 → 登录同意 → 页面显示授权码。
+/// 控制台登录和设置窗口(GUI)共用
+pub fn authcode_url(app_key: &str) -> String {
+    format!(
+        "{OPEN_HOST}/oauth/2.0/authorize?response_type=code&client_id={app_key}&redirect_uri=oob&scope=basic,netdisk"
+    )
+}
 
-    let mut code = String::new();
-    std::io::stdin()
-        .read_line(&mut code)
-        .context("读授权码失败")?;
+/// 用授权码换 token 并保存(控制台登录和设置窗口共用)
+pub fn authcode_exchange(app_key: &str, app_secret: &str, code: &str) -> Result<Token> {
     let code = code.trim();
     if code.is_empty() {
         bail!("授权码为空");
@@ -289,8 +283,23 @@ pub fn authcode_login(app_key: &str, app_secret: &str) -> Result<Token> {
         expires_at: now_secs() + resp.expires_in.unwrap_or(86400).saturating_sub(600),
     };
     token.save()?;
-    println!("授权成功,token 已存到 {:?}", Token::path());
     Ok(token)
+}
+
+/// 授权码模式(oob)登录:应用没开通设备码授权时的替代方案。
+/// 打印授权网址,用户浏览器登录并同意后,页面会显示授权码,
+/// 把码从 stdin 传进来换 token。
+pub fn authcode_login(app_key: &str, app_secret: &str) -> Result<Token> {
+    let url = authcode_url(app_key);
+    println!("== 百度账号授权(授权码模式)==");
+    println!("浏览器打开: {url}");
+    println!("登录并同意授权后,页面会显示授权码,粘贴到这里回车:");
+
+    let mut code = String::new();
+    std::io::stdin()
+        .read_line(&mut code)
+        .context("读授权码失败")?;
+    authcode_exchange(app_key, app_secret, &code)
 }
 
 fn now_secs() -> u64 {

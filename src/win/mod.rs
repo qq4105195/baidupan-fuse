@@ -11,11 +11,14 @@
 //! - hydrate.rs    fetch_data 水合管线(分块下载 + 取消)(M3)
 //! - syncback.rs   本地变更回传队列(防抖/重试/自触抑制)(M4)
 //! - tray.rs       系统托盘:管理隐藏 sync 子进程的日常入口(M6)
+//! - config_gui.rs 设置窗口:原生 Win32 对话框(`bdfs config`/托盘「设置…」)(M7)
 
+pub(crate) mod config_gui;
 mod hydrate;
 mod identity;
 mod provider;
 mod syncback;
+
 pub(crate) mod tray;
 
 use crate::settings::Settings;

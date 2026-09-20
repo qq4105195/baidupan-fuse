@@ -62,7 +62,7 @@ enum Cmd {
     /// 启动系统托盘(右下角图标:开关同步/自启/设置/进度;自动带起同步,日常入口)
     #[cfg(windows)]
     Tray,
-    /// 交互式设置(托盘「设置…」在新控制台窗口里跑的就是它)
+    /// 打开设置窗口(托盘「设置…」弹的就是它;保存后同步自动重启生效)
     #[cfg(windows)]
     Config,
     /// 显示传输进度,按回车退出(托盘「传输进度…」用;也可手动跑)
@@ -179,7 +179,7 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Cmd::Tray => win::tray::run(&settings::Settings::load())?,
         #[cfg(windows)]
-        Cmd::Config => menu::configure(),
+        Cmd::Config => win::config_gui::run()?,
         #[cfg(windows)]
         Cmd::Progress => {
             menu::progress_view();
