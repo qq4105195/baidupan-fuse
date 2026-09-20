@@ -14,6 +14,7 @@
 mod hydrate;
 mod identity;
 mod provider;
+mod syncback;
 
 use crate::settings::Settings;
 use anyhow::{anyhow, Result};
@@ -43,16 +44,21 @@ pub fn run(st: &Settings) -> Result<()> {
     println!("同步根:{}(远端根 {})", sync_root.display(), st.root);
 
     let prov = provider::WinProvider::new(st, sync_root.clone())?;
+    // 启动扫(都在连接后异步动工——update/convert 是 provider-only 调用,
+    // 连接本身毫秒级,线程先睡 1s 兜底):
+    // 1) 修复上次进程暴死留下的撕裂目录 2) 脏扫补传断网改动/没传完的
+    prov.syncback.scan_after_connect(sync_root.clone());
+    let repair_root = sync_root.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        provider::repair_torn_dirs(&repair_root);
+    });
     // 注意:不能开 block_implicit_hydration——实测它把 pin("始终保留在此设备")
     // 触发的后台水合也拦了(13s 无回调),杀软误触发下载的代价认了
     let connection = cloud_filter::root::Session::new()
         .connect(&sync_root, prov)
         .map_err(|e| anyhow!("连接同步根失败:{e}"))?;
     println!("按需同步运行中(双击/右键\"始终保留在此设备\"触发下载)。Ctrl-C 退出。");
-
-    // 启动扫:修复上次进程暴死可能留下的撕裂目录(纯本地,见 provider::repair_torn_dirs)
-    let scan_root = sync_root.clone();
-    std::thread::spawn(move || provider::repair_torn_dirs(&scan_root));
 
     // Ctrl-C / 控制台关闭 → 收到信号断开;ctrlc 在 Windows 上走 SetConsoleCtrlHandler
     let (tx, rx) = std::sync::mpsc::channel::<()>();

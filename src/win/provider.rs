@@ -3,7 +3,7 @@
 //! 回传(M4:closed/state_changed/dirty 扫)后续里程碑接入。
 
 use crate::baidu::NetFile;
-use crate::core::{self, DirCache, DLinkCache, SharedClient};
+use crate::core;
 use crate::progress::Progress;
 use crate::settings::Settings;
 use cloud_filter::error::{CloudErrorKind, CResult};
@@ -23,6 +23,38 @@ fn hydrating_set() -> &'static Mutex<HashSet<PathBuf>> {
     HYDRATING.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// 该文件是否正被水合(下载写盘中)。syncback 用它滤掉下载引发的写事件
+pub(crate) fn is_hydrating(path: &Path) -> bool {
+    hydrating_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(path)
+}
+
+/// 脏文件集(本地改过未回传,进程级):syncback worker 标/清,
+/// dehydrate 回调查——"释放空间"遇脏即拒,防丢改动。
+/// 不在回调里现查 Placeholder:实测死锁(回调 open 同一文件等 oplock,
+/// 而脱水正持有它,双方互等)
+static DIRTY: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+
+fn dirty_set() -> &'static Mutex<HashSet<PathBuf>> {
+    DIRTY.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn mark_dirty(path: &Path) {
+    dirty_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+pub(crate) fn clear_dirty(path: &Path) {
+    dirty_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
+}
+
 /// 记一条"该文件正在 pin 水合中",防属性风暴重复触发;已在水合返回 false
 fn mark_hydrating(path: &Path) -> bool {
     let mut h = hydrating_set().lock().unwrap_or_else(|e| e.into_inner());
@@ -35,19 +67,16 @@ fn mark_hydrating(path: &Path) -> bool {
 
 /// 同步提供方:挂在 Explorer 里的一棵"百度网盘"树
 pub struct WinProvider {
-    /// 共享客户端(锁粒度见 core::SharedClient)
-    pub(crate) client: SharedClient,
+    /// 共享客户端(锁粒度见 core::SharedClient);Arc:syncback worker 持克隆
+    pub(crate) client: std::sync::Arc<core::SharedClient>,
     /// 目录列表缓存(Windows 侧建议 dir_ttl=300:枚举风暴打不起配额)
-    pub(crate) dir_cache: DirCache,
+    pub(crate) dir_cache: std::sync::Arc<core::DirCache>,
     /// dlink 缓存(水合用)
-    pub(crate) dlink_cache: DLinkCache,
+    pub(crate) dlink_cache: std::sync::Arc<core::DLinkCache>,
     /// 水合协调器(并发限 3 + 取消标志)
     pub(crate) hydrator: super::hydrate::Hydrator,
-    /// 脏文件集(本地改过未回传):dehydrate 据此拒绝"释放空间"防丢改动。
-    /// M4 的变更追踪(USN/启动脏扫)负责往里填;M3 阶段恒空=全部放行。
-    /// 注意不能在回调里现查 Placeholder(实测死锁:回调里 open 同一文件
-    /// 等 oplock,而脱水正持有它,双方互等)
-    dirty: Mutex<HashSet<PathBuf>>,
+    /// 回传管线(M4):watcher + 防抖队列 + worker
+    pub(crate) syncback: super::syncback::SyncBack,
     /// 远端根(网盘里的哪棵子树映射到同步根)
     pub(crate) root: String,
     /// 本地同步根绝对路径
@@ -58,16 +87,27 @@ pub struct WinProvider {
 
 impl WinProvider {
     pub fn new(st: &Settings, sync_root: PathBuf) -> anyhow::Result<Self> {
-        let client = crate::baidu::BaiduClient::from_config()?;
+        let client = std::sync::Arc::new(core::SharedClient::new(crate::baidu::BaiduClient::from_config()?));
+        let dir_cache = std::sync::Arc::new(core::DirCache::new(st.dir_ttl));
+        let dlink_cache = std::sync::Arc::new(core::DLinkCache::new(st.dlink_ttl));
+        let progress = Progress::new();
+        let syncback = super::syncback::SyncBack::new(
+            client.clone(),
+            dir_cache.clone(),
+            dlink_cache.clone(),
+            progress.clone(),
+            sync_root.clone(),
+            core::normalize_root(&st.root),
+        );
         Ok(Self {
-            client: SharedClient::new(client),
-            dir_cache: DirCache::new(st.dir_ttl),
-            dlink_cache: DLinkCache::new(st.dlink_ttl),
+            client,
+            dir_cache,
+            dlink_cache,
             hydrator: super::hydrate::Hydrator::new(),
-            dirty: Mutex::new(HashSet::new()),
+            syncback,
             root: core::normalize_root(&st.root),
             sync_root,
-            progress: Progress::new(),
+            progress,
         })
     }
 
@@ -218,8 +258,8 @@ impl SyncFilter for WinProvider {
     }
 
     /// 脱水("释放空间"):干净(已回传)才放行;脏文件拒绝,防丢本地改动。
-    /// M4 回传上线后这里才有实际意义——现在占位符不会被标脏,
-    /// 但 in-sync 状态由内核按注册的 InSyncPolicy 维护,提前按它判
+    /// 脏判定用进程内 DIRTY 集(syncback 入队时标、传完清),不现查
+    /// Placeholder(死锁,见 DIRTY 注释)
     fn dehydrate(
         &self,
         request: Request,
@@ -227,8 +267,10 @@ impl SyncFilter for WinProvider {
         info: filter::info::Dehydrate,
     ) -> CResult<()> {
         let path = request.path();
-        tracing::info!("dehydrate 回调:{}", path.display());
-        let dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner()).contains(&path);
+        let dirty = dirty_set()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&path);
         if dirty {
             tracing::warn!("拒绝脱水(本地改动未回传):{}", path.display());
             // Dehydrate 的失败应答没有区间字段,Err 路径可用(proxy 已不 unwrap)
@@ -313,6 +355,126 @@ impl SyncFilter for WinProvider {
             .map_err(|_| CloudErrorKind::Unsuccessful)?;
         tracing::debug!("填充 {remote}:建 {} 条(共 {} 条,其余为已有/非法名)", phs.len(), files.len());
         Ok(())
+    }
+
+    /// 写句柄(打开时有写/删权限)关闭:文件可能被改过 → 交给 syncback
+    /// 分类(占位符且 in_sync 被内核清了才会上传)
+    fn closed(&self, request: Request, info: filter::info::Closed) {
+        if info.deleted() {
+            return; // 关句柄顺带删了文件:deleted 回调管
+        }
+        self.syncback.touch(request.path());
+    }
+
+    /// 占位符将被删除:先删远端(秒级,回调内直接做),成了才放行;
+    /// 失败返回 Err —— Explorer 会把删除弹回来,忠实反馈"网盘删不掉"
+    fn delete(
+        &self,
+        request: Request,
+        ticket: ticket::Delete,
+        info: filter::info::Delete,
+    ) -> CResult<()> {
+        let path = request.path();
+        if info.is_undelete() {
+            // 回收站还原之类:本地操作照放,远端由 NewEntry/枚举对齐
+            return ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful);
+        }
+        let Some(remote) = core::local_to_remote(&path, &self.sync_root, &self.root) else {
+            return ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful);
+        };
+        tracing::info!("删除 {remote}(is_dir={})", info.is_directory());
+        match self.client.with(|c| c.delete(&remote)) {
+            Ok(()) => {
+                self.dir_cache.remove(&core::parent_of(&remote));
+                self.syncback.mark_handled(path); // 抵掉 watcher 的 Removed
+                ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful)
+            }
+            Err(e) if crate::baidu::is_forbidden(&e) => {
+                tracing::error!("远端删除 {remote} 被拒:{e:#}");
+                Err(CloudErrorKind::AccessDenied)
+            }
+            Err(e) => {
+                tracing::error!("远端删除 {remote} 失败:{e:#}");
+                Err(map_cloud_err(&e))
+            }
+        }
+    }
+
+    /// 占位符将被改名/移动(占位符才有此回调;普通文件走 syncback watcher):
+    /// - 根内改名/移动 → 远端 mv,失败弹回
+    /// - 移出同步根(进回收站等)→ 远端删源
+    /// - 从根外移入 → 放行,目标按新条目补传
+    fn rename(
+        &self,
+        request: Request,
+        ticket: ticket::Rename,
+        info: filter::info::Rename,
+    ) -> CResult<()> {
+        let from = request.path();
+        let to = info.target_path();
+        if !info.source_in_scope() {
+            if info.target_in_scope() {
+                // 外部拖入:本地已是现成文件,转占位符/上传交给 syncback
+                self.syncback.new_entry(to);
+            }
+            return ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful);
+        }
+        let Some(from_remote) = core::local_to_remote(&from, &self.sync_root, &self.root) else {
+            return ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful);
+        };
+        if !info.target_in_scope() {
+            // 移出根 = 从这棵树消失:远端删源,失败弹回(别让本地先没)
+            tracing::info!("移出同步根,远端删源:{from_remote}");
+            return match self.client.with(|c| c.delete(&from_remote)) {
+                Ok(()) => {
+                    self.dir_cache.remove(&core::parent_of(&from_remote));
+                    self.syncback.mark_handled(from);
+                    ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful)
+                }
+                Err(e) => {
+                    tracing::error!("移出时远端删 {from_remote} 失败:{e:#}");
+                    Err(map_cloud_err(&e))
+                }
+            };
+        }
+        let Some(to_remote) = core::local_to_remote(&to, &self.sync_root, &self.root) else {
+            return ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful);
+        };
+        let dest = core::parent_of(&to_remote);
+        let newname = to
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        tracing::info!("改名 {from_remote} → {to_remote}(is_dir={})", info.is_directory());
+        match self.client.with(|c| c.mv(&from_remote, &dest, &newname)) {
+            Ok(()) => {
+                self.dir_cache.remove(&core::parent_of(&from_remote));
+                self.dir_cache.remove(&dest);
+                // 抵掉 watcher 的 Renamed,以及平台改名后清 in_sync
+                // 必然补发的 Touch(否则改名会被误判成改动而整文件重传)
+                self.syncback.mark_handled(from);
+                self.syncback.mark_handled(to);
+                ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful)
+            }
+            Err(e) => {
+                tracing::error!("远端改名 {from_remote} 失败:{e:#}");
+                Err(map_cloud_err(&e))
+            }
+        }
+    }
+
+    /// 删除完成通知:记日志(远端在 delete 回调里已处理)
+    fn deleted(&self, request: Request, _info: filter::info::Deleted) {
+        tracing::info!("已删除:{}", request.path().display());
+    }
+
+    /// 改名完成通知:记日志(远端在 rename 回调里已处理)
+    fn renamed(&self, request: Request, info: filter::info::Renamed) {
+        tracing::info!(
+            "已改名:{} → {}",
+            info.source_path().display(),
+            request.path().display()
+        );
     }
 }
 
