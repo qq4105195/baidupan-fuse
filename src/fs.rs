@@ -11,7 +11,8 @@
 //!   暂存文件,flush/release 时按官方三段式(precreate → superfile2 分片
 //!   → create)传回网盘,分片进度复用下载那套 progress.json。
 
-use crate::baidu::{upload_slice_size, ApiError, BaiduClient, NetFile};
+use crate::baidu::{ApiError, BaiduClient, NetFile};
+use crate::core::{self, join_path, parent_of, DirCache, DLinkCache, SharedClient};
 use anyhow::anyhow;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -20,7 +21,6 @@ use fuser::{
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,15 +30,6 @@ const ROOT_INO: u64 = 1;
 const TTL: Duration = Duration::from_secs(60);
 /// 判定"顺序读"的容差:上一次读的结尾和这次的起点差在这个窗口内,就预读下一块
 const SEQ_TOLERANCE: u64 = 256 * 1024;
-
-/// 路径拼接:父目录是 "/" 时不要出现 "//"
-pub fn join_path(parent: &str, name: &str) -> String {
-    if parent == "/" {
-        format!("/{name}")
-    } else {
-        format!("{parent}/{name}")
-    }
-}
 
 /// fusermount 是否可用。AutoUnmount 的卸载(以及挂载本身)在 fuser 里强制走
 /// fusermount3/fusermount 外部二进制;Android 等没有它的环境会直接 ENOENT。
@@ -52,15 +43,6 @@ pub fn have_fusermount() -> bool {
             .status()
             .is_ok()
     })
-}
-
-/// 父目录:"/" 的父还是 "/"
-pub fn parent_of(path: &str) -> String {
-    match path.rfind('/') {
-        Some(0) => "/".to_string(),
-        Some(i) => path[..i].to_string(),
-        None => "/".to_string(),
-    }
 }
 
 /// 一次写会话:改动先落本地暂存文件,close(flush)时三段式传回网盘。
@@ -86,23 +68,19 @@ struct WriteSession {
 }
 
 pub struct PanFs {
-    client: BaiduClient,
+    /// 共享客户端(FUSE 本身单线程分发,统一走 core 的锁粒度模型留扩展余地)
+    client: SharedClient,
     /// 挂载的远端根目录(未过审应用只能访问 /apps/<应用名>,用它挂对应目录)
     /// 目前只做记录,路径解析走 ino↔path 表;后续做挂载内路径校验/日志用
     #[allow(dead_code)]
     root: String,
-    /// 目录列表缓存时长
-    dir_ttl: Duration,
-    /// 下载直链缓存时长(官方 8 小时有效,默认保守取 30 分钟)。
-    /// 实测顺序复用同一 dlink 没问题,之前的 403 是并发波浪触发的
-    dlink_ttl: Duration,
-    /// fs_id -> (dlink, 拉取时刻)
-    dlink_cache: HashMap<u64, (String, Instant)>,
+    /// 目录列表缓存(TTL;配额生命线,见 core::DirCache)
+    dir_cache: DirCache,
     next_ino: u64,
     ino_of: HashMap<String, u64>,
     path_of: HashMap<u64, String>,
-    /// 目录路径 -> (条目列表, 拉取时刻)
-    dir_cache: HashMap<String, (Vec<NetFile>, Instant)>,
+    /// fs_id -> dlink 缓存(TTL;官方 8h 有效保守取 30 分钟,见 core::DLinkCache)
+    dlink_cache: DLinkCache,
     // ---- 顺序读加速:块缓存 + 预读 ----
     /// 块大小(字节)。内核单次 read 上限 128KB,直接打 API 每次一个
     /// HTTP 往返(实测 160KB/s);按块拉取+缓存后顺序读 ≈ 单块拉取速度。
@@ -146,23 +124,15 @@ impl PanFs {
         cache_mb: u64,
     ) -> Self {
         // 规范化:必须以 / 开头,去掉末尾 /(根目录保留 "/")
-        let mut root = root.trim_end_matches('/').to_string();
-        if !root.starts_with('/') {
-            root = format!("/{root}");
-        }
-        if root.is_empty() {
-            root = "/".to_string();
-        }
+        let root = core::normalize_root(root);
         let mut fs = Self {
-            client,
+            client: SharedClient::new(client),
             root: root.clone(),
-            dir_ttl: Duration::from_secs(dir_ttl.max(1)),
-            dlink_ttl: Duration::from_secs(dlink_ttl.max(1)),
-            dlink_cache: HashMap::new(),
+            dir_cache: DirCache::new(dir_ttl),
+            dlink_cache: DLinkCache::new(dlink_ttl),
             next_ino: ROOT_INO + 1,
             ino_of: HashMap::new(),
             path_of: HashMap::new(),
-            dir_cache: HashMap::new(),
             block_size: (block_mb.max(1) << 20),
             parallel: parallel.max(1) as usize,
             blocks: HashMap::new(),
@@ -198,30 +168,9 @@ impl PanFs {
         ino
     }
 
-    /// 列目录(带 TTL 缓存)。返回克隆,避免和后续 &mut 调用打架。
+    /// 列目录(TTL 缓存在 core::DirCache:未过审 10 次/小时,不打缓存配额秒光)
     fn list(&mut self, dir: &str) -> anyhow::Result<Vec<NetFile>> {
-        if let Some((files, at)) = self.dir_cache.get(dir) {
-            if at.elapsed() < self.dir_ttl {
-                return Ok(files.clone());
-            }
-        }
-        let files = self.client.list_dir(dir)?;
-        tracing::debug!("拉取目录 {dir}: {} 条", files.len());
-        self.dir_cache.insert(dir.to_string(), (files.clone(), Instant::now()));
-        Ok(files)
-    }
-
-    /// 拿 dlink(带 TTL 缓存)。实测顺序复用同一 dlink 完全没问题,
-    /// filemetas 便宜但也没必要每块一查;缓存过期/被 403 时自然换新
-    fn dlink(&mut self, fs_id: u64) -> anyhow::Result<String> {
-        if let Some((d, at)) = self.dlink_cache.get(&fs_id) {
-            if at.elapsed() < self.dlink_ttl {
-                return Ok(d.clone());
-            }
-        }
-        let d = self.client.get_dlink(fs_id)?;
-        self.dlink_cache.insert(fs_id, (d.clone(), Instant::now()));
-        Ok(d)
+        self.dir_cache.get_or_fetch(&self.client, dir)
     }
 
     /// 从父目录列表里找指定路径的条目( getattr/read 复用 )
@@ -239,8 +188,8 @@ impl PanFs {
         &self.progress
     }
 
-    /// 统一的带重试拉取:403(dlink 失效/被限)时弃缓存换新链再来,
-    /// 最多 2 次,带递增退避。整块拉取和随机读窗口共用。
+    /// 统一的带重试拉取(core::SharedClient::fetch_range:403 弃 dlink 缓存
+    /// 换新链重试 ≤2,退避递增)。整块拉取和随机读窗口共用。
     /// path/kind 只用于进度展示
     fn fetch_with_retry(
         &mut self,
@@ -250,26 +199,16 @@ impl PanFs {
         off: u64,
         len: u64,
     ) -> anyhow::Result<Vec<u8>> {
-        let mut attempt = 0u32;
-        loop {
-            let dlink = self.dlink(fs_id)?;
-            let id = self.progress.begin(path, kind, off, len);
-            let r = self
-                .client
-                .read_range(&dlink, off, len, self.parallel, &self.progress, id);
-            self.progress.end(id, r.is_ok());
-            match r {
-                Ok(d) => return Ok(d),
-                Err(e) if attempt < 2 && crate::baidu::is_forbidden(&e) => {
-                    attempt += 1;
-                    // 403 多半意味着这条 dlink 已被限/失效,弃缓存下次换新链
-                    self.dlink_cache.remove(&fs_id);
-                    tracing::warn!("下载 403,弃 dlink 缓存换新链重试(第 {attempt} 次)");
-                    std::thread::sleep(Duration::from_millis(300 * attempt as u64));
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        self.client.fetch_range(
+            &self.dlink_cache,
+            fs_id,
+            path,
+            kind,
+            off,
+            len,
+            self.parallel,
+            &self.progress,
+        )
     }
 
     /// 确保某块在缓存里:没有就整块拉(内部并发数由 --parallel 决定),
@@ -459,8 +398,8 @@ impl PanFs {
         Ok(())
     }
 
-    /// 上传会话:补虚段 → 逐片算 md5 → precreate → 传缺片 → create。
-    /// 秒传(precreate 返回 None)直接收尾
+    /// 上传会话:补虚段 → 三段式上传(编排移到 core::upload_local_file,
+    /// 与 Windows 回传共用)。秒传(precreate 返回 None)直接收尾
     fn upload_session(&mut self, ino: u64) -> anyhow::Result<()> {
         let (path, tmp, target) = match self.writes.get(&ino) {
             Some(s) => (s.path.clone(), s.tmp.clone(), s.target),
@@ -468,45 +407,9 @@ impl PanFs {
         };
         // 1) 补齐 [len,target) 虚段
         self.backfill(ino, target)?;
-
-        // 2) 分片规则:4MB 起步,>4GB 自动放大,保证 ≤1024 片(官方上限)
-        let slice = upload_slice_size(target);
-        let nblocks = target.div_ceil(slice);
-        let f = std::fs::File::open(&tmp)?;
-        let mut buf = vec![0u8; slice as usize];
-        let mut md5s: Vec<String> = Vec::with_capacity(nblocks as usize);
-        if nblocks == 0 {
-            // 空文件:block_list=[] 会被 precreate 拒(errno=2)。
-            // 用空串 md5 当唯一分片,实测 precreate 直接回 need=[] 免传,create 收尾
-            md5s.push(format!("{:x}", md5::compute(&[])));
-        }
-        for i in 0..nblocks {
-            let want = slice.min(target - i * slice) as usize;
-            f.read_exact_at(&mut buf[..want], i * slice)?;
-            md5s.push(format!("{:x}", md5::compute(&buf[..want])));
-        }
-
-        // 3~5) 三段式
-        let new_id = match self.client.precreate(&path, target, &md5s)? {
-            None => None, // 秒传
-            Some((uploadid, need)) => {
-                for seq in need {
-                    if seq >= nblocks {
-                        anyhow::bail!("precreate 要分片#{seq},本地只有 {nblocks} 片");
-                    }
-                    let off = seq * slice;
-                    let want = slice.min(target - off) as usize;
-                    let mut data = vec![0u8; want];
-                    f.read_exact_at(&mut data, off)?;
-                    self.client
-                        .upload_slice(&uploadid, &path, seq, &data, &self.progress)?;
-                }
-                Some(self.client.create_file(&path, target, &uploadid, &md5s)?)
-            }
-        };
-        drop(f);
+        // 2~4) md5 分片 → precreate → 传缺片 → create
+        let new_id = core::upload_local_file(&self.client, &self.progress, &tmp, &path, target)?;
         self.finish_upload(ino, new_id);
-        tracing::info!("上传完成:{path}({target} 字节,{} 片)", nblocks);
         Ok(())
     }
 
@@ -526,7 +429,7 @@ impl PanFs {
             s.dirty = false;
         }
         if old_id != 0 {
-            self.dlink_cache.remove(&old_id);
+            self.dlink_cache.remove(old_id);
         }
         if !parent.is_empty() {
             self.dir_cache.remove(&parent);
@@ -574,8 +477,9 @@ impl PanFs {
         // 本地已物化部分
         let local = n.min(len.saturating_sub(offset));
         if local > 0 {
-            let read_ok =
-                std::fs::File::open(&tmp).and_then(|f| f.read_exact_at(&mut buf[..local as usize], offset));
+            let read_ok = std::fs::File::open(&tmp).and_then(|mut f| {
+                core::read_exact_at(&mut f, &mut buf[..local as usize], offset)
+            });
             if let Err(e) = read_ok {
                 tracing::warn!("读暂存 {} 失败:{e}", tmp.display());
                 reply.error(libc::EIO);
@@ -651,12 +555,12 @@ impl PanFs {
             reply.error(if want_dir { libc::ENOTDIR } else { libc::EISDIR });
             return;
         }
-        if let Err(e) = self.client.delete(&f.path) {
+        if let Err(e) = self.client.with(|c| c.delete(&f.path)) {
             reply.error(map_err(&e));
             return;
         }
         self.dir_cache.remove(&parent_path);
-        self.dlink_cache.remove(&f.fs_id);
+        self.dlink_cache.remove(f.fs_id);
         // 正在写的会话/读缓存一并清
         if let Some(ino) = self.ino_of.remove(&f.path) {
             self.path_of.remove(&ino);
@@ -1065,7 +969,7 @@ impl Filesystem for PanFs {
         };
         let name = name.to_string_lossy();
         let path = join_path(&parent_path, &name);
-        match self.client.mkdir(&path) {
+        match self.client.with(|c| c.mkdir(&path)) {
             Ok(fs_id) => {
                 self.dir_cache.remove(&parent_path);
                 let ino = self.alloc_ino(&path);
@@ -1145,7 +1049,7 @@ impl Filesystem for PanFs {
                         reply.error(libc::EISDIR);
                         return;
                     }
-                    if let Err(e) = self.client.delete(&t.path) {
+                    if let Err(e) = self.client.with(|c| c.delete(&t.path)) {
                         reply.error(map_err(&e));
                         return;
                     }
@@ -1163,7 +1067,7 @@ impl Filesystem for PanFs {
             }
         }
 
-        if let Err(e) = self.client.mv(&from, &dest_dir, &newname) {
+        if let Err(e) = self.client.with(|c| c.mv(&from, &dest_dir, &newname)) {
             reply.error(map_err(&e));
             return;
         }
@@ -1340,7 +1244,7 @@ impl Filesystem for PanFs {
     /// df 用:总容量/已用映射到块统计
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         // 容量接口失败不影响挂载可用性,退化成全 0
-        match self.client.quota() {
+        match self.client.with(|c| c.quota()) {
             Ok((total, used)) => {
                 let blocks = total / 512;
                 let free = total.saturating_sub(used) / 512;
@@ -1351,23 +1255,5 @@ impl Filesystem for PanFs {
                 reply.statfs(0, 0, 0, 0, 0, 512, 255, 512);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn 路径拼接() {
-        assert_eq!(join_path("/", "a"), "/a");
-        assert_eq!(join_path("/apps/d", "x.txt"), "/apps/d/x.txt");
-    }
-
-    #[test]
-    fn 父目录() {
-        assert_eq!(parent_of("/"), "/");
-        assert_eq!(parent_of("/a"), "/");
-        assert_eq!(parent_of("/apps/d/f.txt"), "/apps/d");
     }
 }

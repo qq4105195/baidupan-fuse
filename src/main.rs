@@ -5,6 +5,7 @@
 //! 裸跑(不带子命令)进交互控制台,子命令供脚本使用。
 
 mod baidu;
+mod core;
 #[cfg(unix)]
 mod fs;
 mod menu;

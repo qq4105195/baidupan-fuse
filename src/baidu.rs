@@ -603,99 +603,10 @@ impl BaiduClient {
             .ok_or_else(|| anyhow!("filemetas 响应缺 dlink"))
     }
 
-    /// 拉一段数据:切成 parts 份并行 Range 请求,按序拼接(aria2 式多连接下载)。
-    /// prog/id 用于实时进度:每个分片收到多少字节就 add 多少。
-    pub fn read_range(
-        &self,
-        dlink: &str,
-        offset: u64,
-        len: u64,
-        parts: usize,
-        prog: &Progress,
-        id: u64,
-    ) -> Result<Vec<u8>> {
-        if parts <= 1 || len < (1 << 20) {
-            return Self::fetch_part(&self.http, dlink, &self.token.access_token, offset, len, prog, id);
-        }
-        let chunk = len.div_ceil(parts as u64);
-        // 各分片起点;末尾凑不满 parts 份就少开线程
-        let starts: Vec<u64> = (0..parts as u64)
-            .map(|i| offset + i * chunk)
-            .take_while(|&off| off < offset + len)
-            .collect();
-
-        let results = std::thread::scope(|s| {
-            let handles: Vec<_> = starts
-                .into_iter()
-                .map(|off| {
-                    let l = chunk.min(offset + len - off);
-                    // Progress 是 Arc 包裹,clone 给线程很便宜
-                    let prog = prog.clone();
-                    s.spawn(move || {
-                        Self::fetch_part(&self.http, dlink, &self.token.access_token, off, l, &prog, id)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("下载线程 panic"))
-                .collect::<Vec<_>>()
-        });
-
-        let mut out = Vec::with_capacity(len as usize);
-        for r in results {
-            out.extend(r?);
-        }
-        Ok(out)
-    }
-
-    /// 单段 Range 拉取(核心,串行/并发共用):
-    /// UA 必须是 pan.baidu.com,302 自动跟随,支持断点续传。
-    /// 响应体按 64KB 边收边记进度,而不是一次性 bytes()。
-    fn fetch_part(
-        http: &reqwest::blocking::Client,
-        dlink: &str,
-        token: &str,
-        offset: u64,
-        len: u64,
-        prog: &Progress,
-        id: u64,
-    ) -> Result<Vec<u8>> {
-        // dlink 本身带 query 参数,token 直接拼在后面
-        let url = format!("{dlink}&access_token={token}");
-        let end = offset + len - 1;
-        let mut resp = http
-            .get(&url)
-            .header(reqwest::header::USER_AGENT, DL_UA)
-            // 实测 CDN 会 403 掉"同一 keep-alive 连接上的第二个 Range 请求",
-            // 每个分片用独立连接(curl 的行为),代价只是每片一次 TLS 握手
-            .header(reqwest::header::CONNECTION, "close")
-            .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
-            .send()?
-            .error_for_status()?;
-        let status = resp.status();
-        let mut buf = Vec::with_capacity(len as usize);
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            let n = resp.read(&mut chunk)?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            prog.add(id, n as u64);
-        }
-        if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            Ok(buf)
-        } else {
-            // 服务器忽略 Range 返回了 200 全量:自己切窗口(仅当文件不大时可行,兜底逻辑)
-            let s = offset as usize;
-            let e = (offset + len) as usize;
-            if s >= buf.len() {
-                Ok(Vec::new())
-            } else {
-                Ok(buf[s..e.min(buf.len())].to_vec())
-            }
-        }
+    /// 下载快照:克隆 HTTP 句柄(Client 内部是 Arc,便宜)+ 当前 access_token。
+    /// 给"锁内取快照 → 锁外长传输"用:并发下载不能全程占着客户端锁
+    pub fn download_handle(&self) -> (reqwest::blocking::Client, String) {
+        (self.http.clone(), self.token.access_token.clone())
     }
 
     /// 三段式上传第一步 precreate。
@@ -894,5 +805,102 @@ impl BaiduClient {
             "newname": newname,
         })])?;
         self.filemanager("move", filelist)
+    }
+}
+
+// ---------- 下载(自由函数版,供锁外快照调用) ----------
+
+/// 拉一段数据(read_range 的自由函数版):切成 parts 份并行 Range 请求,按序拼接。
+/// http/token 来自 download_handle() 快照——调用方在客户端锁外传输。
+/// prog/id 用于实时进度:每个分片收到多少字节就 add 多少。
+pub(crate) fn read_range_with(
+    http: &reqwest::blocking::Client,
+    token: &str,
+    dlink: &str,
+    offset: u64,
+    len: u64,
+    parts: usize,
+    prog: &Progress,
+    id: u64,
+) -> Result<Vec<u8>> {
+    if parts <= 1 || len < (1 << 20) {
+        return fetch_part(http, dlink, token, offset, len, prog, id);
+    }
+    let chunk = len.div_ceil(parts as u64);
+    // 各分片起点;末尾凑不满 parts 份就少开线程
+    let starts: Vec<u64> = (0..parts as u64)
+        .map(|i| offset + i * chunk)
+        .take_while(|&off| off < offset + len)
+        .collect();
+
+    let results = std::thread::scope(|s| {
+        let handles: Vec<_> = starts
+            .into_iter()
+            .map(|off| {
+                let l = chunk.min(offset + len - off);
+                // Progress 是 Arc 包裹,clone 给线程很便宜
+                let prog = prog.clone();
+                s.spawn(move || fetch_part(http, dlink, token, off, l, &prog, id))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("下载线程 panic"))
+            .collect::<Vec<_>>()
+    });
+
+    let mut out = Vec::with_capacity(len as usize);
+    for r in results {
+        out.extend(r?);
+    }
+    Ok(out)
+}
+
+/// 单段 Range 拉取(核心,串行/并发共用):
+/// UA 必须是 pan.baidu.com,302 自动跟随,支持断点续传。
+/// 响应体按 64KB 边收边记进度,而不是一次性 bytes()。
+pub(crate) fn fetch_part(
+    http: &reqwest::blocking::Client,
+    dlink: &str,
+    token: &str,
+    offset: u64,
+    len: u64,
+    prog: &Progress,
+    id: u64,
+) -> Result<Vec<u8>> {
+    // dlink 本身带 query 参数,token 直接拼在后面
+    let url = format!("{dlink}&access_token={token}");
+    let end = offset + len - 1;
+    let mut resp = http
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, DL_UA)
+        // 实测 CDN 会 403 掉"同一 keep-alive 连接上的第二个 Range 请求",
+        // 每个分片用独立连接(curl 的行为),代价只是每片一次 TLS 握手
+        .header(reqwest::header::CONNECTION, "close")
+        .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
+        .send()?
+        .error_for_status()?;
+    let status = resp.status();
+    let mut buf = Vec::with_capacity(len as usize);
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = resp.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        prog.add(id, n as u64);
+    }
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        Ok(buf)
+    } else {
+        // 服务器忽略 Range 返回了 200 全量:自己切窗口(仅当文件不大时可行,兜底逻辑)
+        let s = offset as usize;
+        let e = (offset + len) as usize;
+        if s >= buf.len() {
+            Ok(Vec::new())
+        } else {
+            Ok(buf[s..e.min(buf.len())].to_vec())
+        }
     }
 }
