@@ -1,6 +1,6 @@
 //! WinProvider:cloud_filter 回调实现。
-//! M2 只实现目录枚举(fetch_placeholders)——Explorer 展开目录时把远端
-//! 条目建成云图标占位符;水合(M3)和回传(M4)后续里程碑接入。
+//! M2 起支持目录枚举(fetch_placeholders);M3 起支持水合/取消/脱水。
+//! 回传(M4:closed/state_changed/dirty 扫)后续里程碑接入。
 
 use crate::baidu::NetFile;
 use crate::core::{self, DirCache, DLinkCache, SharedClient};
@@ -9,20 +9,47 @@ use crate::settings::Settings;
 use cloud_filter::error::{CloudErrorKind, CResult};
 use cloud_filter::filter::{self, ticket, Request, SyncFilter};
 use cloud_filter::metadata::{Metadata, MetadataExt};
+use cloud_filter::placeholder::{PinState, Placeholder, UpdateOptions};
 use cloud_filter::placeholder_file::PlaceholderFile;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::os::windows::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// pin 水合在途表(进程级;水合线程结束时跨线程清标记,thread_local 干不了)
+static HYDRATING: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+
+fn hydrating_set() -> &'static Mutex<HashSet<PathBuf>> {
+    HYDRATING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 记一条"该文件正在 pin 水合中",防属性风暴重复触发;已在水合返回 false
+fn mark_hydrating(path: &Path) -> bool {
+    let mut h = hydrating_set().lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = !h.contains(path);
+    if fresh {
+        h.insert(path.to_path_buf());
+    }
+    fresh
+}
 
 /// 同步提供方:挂在 Explorer 里的一棵"百度网盘"树
 pub struct WinProvider {
     /// 共享客户端(锁粒度见 core::SharedClient)
     pub(crate) client: SharedClient,
     /// 目录列表缓存(Windows 侧建议 dir_ttl=300:枚举风暴打不起配额)
-    dir_cache: DirCache,
-    /// dlink 缓存(M3 水合用;先建好)
+    pub(crate) dir_cache: DirCache,
+    /// dlink 缓存(水合用)
     pub(crate) dlink_cache: DLinkCache,
+    /// 水合协调器(并发限 3 + 取消标志)
+    pub(crate) hydrator: super::hydrate::Hydrator,
+    /// 脏文件集(本地改过未回传):dehydrate 据此拒绝"释放空间"防丢改动。
+    /// M4 的变更追踪(USN/启动脏扫)负责往里填;M3 阶段恒空=全部放行。
+    /// 注意不能在回调里现查 Placeholder(实测死锁:回调里 open 同一文件
+    /// 等 oplock,而脱水正持有它,双方互等)
+    dirty: Mutex<HashSet<PathBuf>>,
     /// 远端根(网盘里的哪棵子树映射到同步根)
-    root: String,
+    pub(crate) root: String,
     /// 本地同步根绝对路径
     pub(crate) sync_root: PathBuf,
     /// 下载/上传进度(progress.json)
@@ -36,29 +63,203 @@ impl WinProvider {
             client: SharedClient::new(client),
             dir_cache: DirCache::new(st.dir_ttl),
             dlink_cache: DLinkCache::new(st.dlink_ttl),
+            hydrator: super::hydrate::Hydrator::new(),
+            dirty: Mutex::new(HashSet::new()),
             root: core::normalize_root(&st.root),
             sync_root,
             progress: Progress::new(),
         })
     }
+
+    /// pin 状态对齐(OneDrive 式即时行为,平台本体两者都懒):
+    /// - UNPINNED + 已回传 + 盘上有数据 → 立即脱水成云图标
+    /// - PINNED + 盘上不完整 → 触发水合(平台会回调 fetch_data,进度条照常)
+    /// 在 state_changed 的监视线程上跑,水合另开线程(它要下完才返回)
+    fn sync_pin_state(&self, path: &Path) {
+        let Ok(Some(pi)) = Placeholder::open(path)
+            .and_then(|p| p.info().map_err(Into::into))
+            .map_err(|e| {
+                tracing::debug!("查 {} 占位符状态失败:{e}", path.display());
+                e
+            })
+        else {
+            return; // 非占位符(普通文件/新建文件):M4 回传管
+        };
+        let on_disk = pi.on_disk_data_size().max(0) as u64;
+        match pi.pin_state() {
+            PinState::Unpinned if pi.is_in_sync() && on_disk > 0 => {
+                self.dehydrate_now(path);
+            }
+            PinState::Pinned if !pi.is_in_sync() => {
+                // 脏文件被 pin:等 M4 回传完成后再说,现在别动
+            }
+            PinState::Pinned => {
+                let logical = std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX);
+                if on_disk >= logical {
+                    // 已完整落地:水合若在途,清掉标记
+                    hydrating_set()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(path);
+                } else if mark_hydrating(path) {
+                    let p = path.to_path_buf();
+                    std::thread::spawn(move || {
+                        let r = Placeholder::open(&p).and_then(|mut ph| ph.hydrate(..));
+                        match r {
+                            Ok(()) => tracing::info!("pin 水合完成:{}", p.display()),
+                            Err(e) => tracing::warn!("pin 水合 {} 失败:{e}", p.display()),
+                        }
+                        hydrating_set()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&p);
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 立即脱水(独占写句柄由平台要求;Explorer 松手要一两秒,重试几下)
+    fn dehydrate_now(&self, path: &Path) {
+        for i in 0..3 {
+            let Ok(f) = std::fs::OpenOptions::new()
+                .access_mode(0x4000_0000) // GENERIC_WRITE
+                .share_mode(0) // 独占
+                .open(path)
+            else {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            };
+            let mut ph = Placeholder::from(f);
+            match ph.update(UpdateOptions::default().dehydrate(), None) {
+                Ok(_) => {
+                    tracing::info!("已脱水(用户释放空间):{}", path.display());
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("脱水 {} 失败(第{}次):{e}", path.display(), i + 1);
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+        }
+    }
+
+    /// 解析水合目标的 fs_id:优先身份 blob;id=0(秒传)或 blob 坏时
+    /// 按父目录列表回查(本地路径大小写可能与远端不一致,忽略大小写匹配)。
+    /// 查不到返回 0,由水合管线发失败应答
+    fn resolve_fs_id(&self, request: &Request, remote: &str) -> u64 {
+        if let Some(id) = super::identity::decode(request.file_blob()).filter(|i| i.id != 0) {
+            return id.id;
+        }
+        let parent = core::parent_of(remote);
+        match self.dir_cache.get_or_fetch(&self.client, &parent) {
+            Ok(files) => {
+                let hit = files
+                    .iter()
+                    .find(|f| f.path.eq_ignore_ascii_case(remote))
+                    .map(|f| f.fs_id);
+                match hit {
+                    Some(id) => {
+                        tracing::debug!("fs_id 回查命中:{remote} -> {id}");
+                        id
+                    }
+                    None => {
+                        tracing::warn!("父目录里找不到 {remote},无法解析 fs_id");
+                        0
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("回查 fs_id 列 {parent} 失败:{e:#}");
+                0
+            }
+        }
+    }
 }
 
 impl SyncFilter for WinProvider {
-    /// M3 实现(1MB 分块流式下载 + 进度);现在双击打开会报错,是本里程碑预期行为。
-    /// 注意:不能直接返回 Err——上游 proxy 同步发的 Write::fail 填的 Offset/Length
-    /// 全 0,会被平台拒绝并 unwrap 杀进程(vendor/cloud-filter/PATCHES.md);
-    /// 正确姿势是带 required range 自己发失败应答,然后返回 Ok
+    /// 水合:按 required 区间分块下载进占位符(管线在 hydrate.rs)。
+    /// 错误一律在回调内用 ticket 带区间上报后返回 Ok——直接返回 Err 会走
+    /// proxy 的同步失败应答(全 0 区间,被平台拒绝,用户等 60s 超时),
+    /// 见 vendor/cloud-filter/PATCHES.md
     fn fetch_data(
         &self,
-        _request: Request,
+        request: Request,
         ticket: ticket::FetchData,
         info: filter::info::FetchData,
     ) -> CResult<()> {
-        tracing::warn!("fetch_data:水合还没实现(M3)");
-        if let Err(e) = ticket.fail(CloudErrorKind::Unsuccessful, info.required_file_range()) {
-            tracing::warn!("失败应答未送达(平台将按超时处理):{e}");
+        let local = request.path();
+        let Some(remote) = core::local_to_remote(&local, &self.sync_root, &self.root) else {
+            tracing::error!("水合请求在同步根之外:{},拒绝", local.display());
+            if let Err(e) = ticket.fail(CloudErrorKind::NotUnderSyncRoot, info.required_file_range())
+            {
+                tracing::warn!("失败应答未送达(平台将按超时处理):{e}");
+            }
+            return Ok(());
+        };
+        if info.interrupted_hydration() {
+            tracing::info!("续传(上次水合被中断):{remote}");
         }
-        Ok(())
+        let fs_id = self.resolve_fs_id(&request, &remote);
+        self.hydrator.fetch(
+            self,
+            &remote,
+            fs_id,
+            request.file_size(),
+            info.required_file_range(),
+            ticket,
+        )
+    }
+
+    /// 取消水合:置取消标志,块间生效(已写部分保留,天然断点续传)
+    fn cancel_fetch_data(&self, request: Request, info: filter::info::CancelFetchData) {
+        self.hydrator.cancel(&request.path(), &info);
+    }
+
+    /// 脱水("释放空间"):干净(已回传)才放行;脏文件拒绝,防丢本地改动。
+    /// M4 回传上线后这里才有实际意义——现在占位符不会被标脏,
+    /// 但 in-sync 状态由内核按注册的 InSyncPolicy 维护,提前按它判
+    fn dehydrate(
+        &self,
+        request: Request,
+        ticket: ticket::Dehydrate,
+        info: filter::info::Dehydrate,
+    ) -> CResult<()> {
+        let path = request.path();
+        tracing::info!("dehydrate 回调:{}", path.display());
+        let dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner()).contains(&path);
+        if dirty {
+            tracing::warn!("拒绝脱水(本地改动未回传):{}", path.display());
+            // Dehydrate 的失败应答没有区间字段,Err 路径可用(proxy 已不 unwrap)
+            return Err(CloudErrorKind::Unsuccessful);
+        }
+        tracing::info!(
+            "放行脱水:{}(background={},reason={:?})",
+            path.display(),
+            info.background(),
+            info.reason()
+        );
+        let r = ticket.pass();
+        tracing::info!("脱水应答已发:{} -> {r:?}", path.display());
+        r.map_err(|_| CloudErrorKind::Unsuccessful)
+    }
+
+    /// 脱水完成通知:仅记日志(dlink 缓存按 TTL 自然过期即可)
+    fn dehydrated(&self, request: Request, info: filter::info::Dehydrated) {
+        tracing::info!(
+            "已脱水:{}(background={})",
+            request.path().display(),
+            info.background()
+        );
+    }
+
+    /// 属性变更回调(crate 用 ReadDirectoryChangesW 监听,pin/unpin 也算属性):
+    /// 把文件对齐到用户要的 pin 状态(unpin→脱水回云图标;pin→触发水合)
+    fn state_changed(&self, changes: Vec<PathBuf>) {
+        for p in changes {
+            self.sync_pin_state(&p);
+        }
     }
 
     /// 目录枚举:Explorer 展开目录时回调,把远端条目批量建成本地占位符。
@@ -88,15 +289,21 @@ impl SyncFilter for WinProvider {
             }
         };
 
-        // 本地已有同名条目(占位符或真实文件)跳过:重展开只补缺,不覆盖
-        let existing = list_local_names(&dir);
+        // 本地已有同名条目(占位符或真实文件)跳过:重展开只补缺,不覆盖。
+        // 例外:同名"普通目录"(没有 reparse,多为进程暴死时枚举回调被打断
+        // 留下的残迹)要转回占位符,否则它永远不会再触发按需填充
+        let existing = list_local_entries(&dir);
         let mut phs: Vec<PlaceholderFile> = Vec::with_capacity(files.len());
         for f in &files {
             if !win_name_ok(&f.name) {
                 tracing::warn!("跳过 Windows 非法名:{}", f.path);
                 continue;
             }
-            if existing.contains(&f.name.to_lowercase()) {
+            if let Some(ent) = existing.get(&f.name.to_lowercase()) {
+                if f.is_dir && ent == &LocalEntry::PlainDir {
+                    let local = dir.join(&f.name);
+                    std::thread::spawn(move || repair_plain_dir(&local));
+                }
                 continue;
             }
             push_placeholder(&mut phs, f);
@@ -106,6 +313,140 @@ impl SyncFilter for WinProvider {
             .map_err(|_| CloudErrorKind::Unsuccessful)?;
         tracing::debug!("填充 {remote}:建 {} 条(共 {} 条,其余为已有/非法名)", phs.len(), files.len());
         Ok(())
+    }
+}
+
+/// 启动扫:把可能撕裂的占位符目录(丢了 reparse 的普通目录)转回占位符。
+/// fetch_placeholders 里的同款修复只在新枚举时生效,而"已填充"的目录平台
+/// 不再回调,所以启动时得自己走一遍。纯本地 read_dir(不打 API),秒级。
+/// M4 上线后新建本地目录归回传管线管,届时要避开刚建的(按 mtime)
+pub(crate) fn repair_torn_dirs(root: &Path) {
+    walk_repair(root, 0);
+}
+
+fn walk_repair(dir: &Path, depth: usize) {
+    // 同步根本身不是占位符,从子级开始扫;深度封顶防御环/超深树
+    if depth > 8 {
+        return;
+    }
+    use std::os::windows::fs::MetadataExt;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        if !e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let plain = e
+            .metadata()
+            .map(|md| md.file_attributes() & 0x400 /* REPARSE_POINT */ == 0)
+            .unwrap_or(true);
+        let p = e.path();
+        if plain {
+            repair_plain_dir(&p);
+        } else {
+            // 已是占位符但本地空着:可能上次转换没带 on-demand 标志
+            // (平台视为"已填充完毕",永远不再回调)。update 补开,幂等
+            if std::fs::read_dir(&p).map(|mut d| d.next().is_none()).unwrap_or(false) {
+                reenable_population(&p);
+            }
+        }
+        walk_repair(&e.path(), depth + 1);
+    }
+}
+
+/// 给"已填充完毕"态的空占位符目录重开按需填充(update 版,句柄要求
+/// 同 convert:GENERIC_WRITE + BACKUP_SEMANTICS;目录常被 Explorer 持着,
+/// 独占会失败,全共享 + 重试)
+fn reenable_population(local: &Path) {
+    use cloud_filter::placeholder::UpdateOptions;
+    for i in 0..3 {
+        let Ok(f) = std::fs::OpenOptions::new()
+            .access_mode(0x4000_0000) // GENERIC_WRITE
+            .share_mode(7)
+            .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+            .open(local)
+        else {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        };
+        let mut ph = Placeholder::from(f);
+        return match ph.update(UpdateOptions::default().has_children(), None) {
+            Ok(_) => tracing::debug!("已重开按需填充:{}", local.display()),
+            Err(e) => {
+                tracing::warn!("重开按需填充 {} 失败(第{}次):{e}", local.display(), i + 1);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        };
+    }
+}
+
+/// 本地目录条目分类(枚举跳过 + 残迹修复用)
+#[derive(PartialEq, Eq)]
+enum LocalEntry {
+    PlainDir,
+    Other,
+}
+
+/// 列出目录下已有名字 → 分类;读不了当空表
+fn list_local_entries(dir: &std::path::Path) -> std::collections::HashMap<String, LocalEntry> {
+    use std::collections::HashMap;
+    use std::os::windows::fs::MetadataExt;
+    let mut m = HashMap::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return m;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        let plain_dir = e
+            .file_type()
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+            && !e
+                .metadata()
+                .map(|md| {
+                    md.file_attributes() & 0x400 /* FILE_ATTRIBUTE_REPARSE_POINT */ != 0
+                })
+                .unwrap_or(true);
+        m.insert(name, if plain_dir { LocalEntry::PlainDir } else { LocalEntry::Other });
+    }
+    m
+}
+
+/// 把普通目录转回占位符目录(blob 补不回来——身份用 id=0 占位,
+/// 水合/回传时会按父目录回查)。has_children 置 on-demand population:
+/// 转完平台在下次展开时回调 fetch_placeholders 补条目
+/// (不带的话默认视为"已填充完毕",目录会一直空着)
+fn repair_plain_dir(local: &Path) {
+    use cloud_filter::placeholder::ConvertOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    let blob = super::identity::encode(&NetFile {
+        fs_id: 0,
+        path: String::new(),
+        name: local.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        is_dir: true,
+        size: 0,
+        mtime: 0,
+    });
+    let f = match std::fs::OpenOptions::new()
+        .access_mode(0x4000_0000) // GENERIC_WRITE(convert 要求)
+        .share_mode(7)
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS(目录必须)
+        .open(local)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("修复目录 {} 打不开:{e}", local.display());
+            return;
+        }
+    };
+    let mut ph = Placeholder::from(f);
+    match ph.convert_to_placeholder(
+        ConvertOptions::default().blob(blob).mark_in_sync().has_children(),
+        None,
+    ) {
+        Ok(_) => tracing::info!("已把普通目录转回占位符:{}", local.display()),
+        Err(e) => tracing::warn!("转换 {} 失败:{e}", local.display()),
     }
 }
 
@@ -126,17 +467,6 @@ fn push_placeholder(out: &mut Vec<PlaceholderFile>, f: &NetFile) {
             .blob(super::identity::encode(f))
             .mark_in_sync(),
     );
-}
-
-/// 目录下已有的名字(小写,匹配用);读不了当空集
-fn list_local_names(dir: &std::path::Path) -> HashSet<String> {
-    std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_lowercase())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// epoch 秒 → Windows FILETIME(1601-01-01 起、100ns 单位)

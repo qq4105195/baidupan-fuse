@@ -11,6 +11,7 @@
 //! - hydrate.rs    fetch_data 水合管线(分块下载 + 取消)(M3)
 //! - syncback.rs   本地变更回传队列(防抖/重试/自触抑制)(M4)
 
+mod hydrate;
 mod identity;
 mod provider;
 
@@ -42,11 +43,16 @@ pub fn run(st: &Settings) -> Result<()> {
     println!("同步根:{}(远端根 {})", sync_root.display(), st.root);
 
     let prov = provider::WinProvider::new(st, sync_root.clone())?;
+    // 注意:不能开 block_implicit_hydration——实测它把 pin("始终保留在此设备")
+    // 触发的后台水合也拦了(13s 无回调),杀软误触发下载的代价认了
     let connection = cloud_filter::root::Session::new()
-        .block_implicit_hydration()
         .connect(&sync_root, prov)
         .map_err(|e| anyhow!("连接同步根失败:{e}"))?;
-    println!("按需同步运行中(云图标占位;双击下载在 M3 上线)。Ctrl-C 退出。");
+    println!("按需同步运行中(双击/右键\"始终保留在此设备\"触发下载)。Ctrl-C 退出。");
+
+    // 启动扫:修复上次进程暴死可能留下的撕裂目录(纯本地,见 provider::repair_torn_dirs)
+    let scan_root = sync_root.clone();
+    std::thread::spawn(move || provider::repair_torn_dirs(&scan_root));
 
     // Ctrl-C / 控制台关闭 → 收到信号断开;ctrlc 在 Windows 上走 SetConsoleCtrlHandler
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -69,7 +75,7 @@ pub fn register(sync_root: &Path) -> Result<()> {
         tracing::info!("同步根已注册,跳过");
         return Ok(());
     }
-    use cloud_filter::root::{HydrationType, PopulationType, SyncRootInfo};
+    use cloud_filter::root::{HydrationType, PopulationType, SupportedAttribute, SyncRootInfo};
     let info = SyncRootInfo::default()
         .with_path(sync_root)
         .map_err(|e| anyhow!("同步根路径不可用:{e}"))?
@@ -79,7 +85,20 @@ pub fn register(sync_root: &Path) -> Result<()> {
         .with_version("1.0.0")
         .with_hydration_type(HydrationType::Full)
         .with_population_type(PopulationType::Full)
-        .with_allow_pinning(true);
+        .with_allow_pinning(true)
+        // InSyncPolicy 声明"哪些本地改动算把文件弄脏":内容/时间/属性全算。
+        // 内核据此自动把 in-sync 清掉,M3 的脱水拒绝、M4 的脏文件回传都靠它
+        .with_supported_attribute(
+            SupportedAttribute::FileSystem
+                | SupportedAttribute::FileCreationTime
+                | SupportedAttribute::FileLastWriteTime
+                | SupportedAttribute::FileReadonly
+                | SupportedAttribute::FileHidden
+                | SupportedAttribute::DirectoryCreationTime
+                | SupportedAttribute::DirectoryLastWriteTime
+                | SupportedAttribute::DirectoryReadonly
+                | SupportedAttribute::DirectoryHidden,
+        );
     id.register(info)
         .map_err(|e| anyhow!("注册同步根失败:{e}"))?;
     println!("已注册同步根(Explorer 侧边栏会出现「百度网盘」)");

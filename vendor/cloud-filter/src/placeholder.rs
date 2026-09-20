@@ -768,7 +768,10 @@ impl Placeholder {
                 options.metadata.map(|x| &x.0 as *const _),
                 (!options.blob.is_empty()).then_some(options.blob.as_ptr() as *const _),
                 options.blob.len() as _,
-                (options.dehydrate_ranges.is_empty()).then_some(&options.dehydrate_ranges),
+                // bdfs patch:上游把条件写反了(is_empty 时传 Some→空 Vec 的悬空
+                // 指针 + count 0,真有区间时反倒传 None 被静默丢弃)。
+                // 空区间应传 NULL,非空才传切片
+                (!options.dehydrate_ranges.is_empty()).then_some(&options.dehydrate_ranges),
                 options.flags,
                 usn.into().map(|u| u as *mut _),
                 None,

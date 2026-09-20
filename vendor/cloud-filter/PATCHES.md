@@ -20,6 +20,32 @@
 - **proxy 不再 unwrap**(兜底):6 处 `command::*::fail(..).unwrap()` 改为 `deliver_fail()`
   记日志后放弃,失败应答万一仍送不出去时按平台超时处理,provider 存活。
 
+## 补丁 2:`Placeholder::update` 的 dehydrate_ranges 条件写反(placeholder.rs)
+
+上游 `update()` 把"dehydrate_ranges 是否传平台"的条件写反了:
+`options.dehydrate_ranges.is_empty().then_some(&options.dehydrate_ranges)` ——
+空区间时传 `Some`(空 Vec → 悬空指针 + count 0),真有区间时反倒传 `None`
+(静默丢弃)。改为 `(!is_empty()).then_some(...)`,空区间传 NULL、非空才传切片。
+
+## 平台行为备忘(非补丁,踩坑记录)
+
+- `CfUpdatePlaceholder` **只能在连了同步根的 provider 进程内调用**:外部工具
+  (GENERIC_WRITE、独占、甚至空 update)一律 `ERROR_CLOUD_FILE_ACCESS_DENIED`
+  (0x8007018B)。cfops 的 `free`/`noop` 动词留作对照复现。
+- `CfDehydratePlaceholder`(crate 的 `ext::FileExt::dehydrate`)已废弃,ack 送达后
+  永远不完成——现代路径是 `CfUpdatePlaceholder` + `CF_UPDATE_FLAG_DEHYDRATE`
+  (GENERIC_WRITE + 独占 Win32 句柄;oplock 句柄会 E_HANDLE)。
+- 平台对 pin/unpin 都是**懒**的:`attrib +u` 只清 pin 标志不脱水,`attrib +p`
+  只置 pin 标志不水合。要 OneDrive 式即时行为,provider 得自己在
+  `state_changed`(属性变更)回调里对齐:unpin+干净+有数据 → update(dehydrate);
+  pin+盘上不全 → `Placeholder::hydrate(..)` 触发 fetch_data。
+- 目录 `convert_to_placeholder` 默认视为"已填充完毕"(不再回调
+  fetch_placeholders);要按需填充得带 `has_children()`
+  (`CF_CONVERT_FLAG_ENABLE_ON_DEMAND_POPULATION`)。已是占位符的空目录可用
+  `UpdateOptions::has_children()` 重开。
+- 在 dehydrate 回调里 `Placeholder::open` 同一文件会**死锁**(回调等 oplock、
+  脱水持有它):回调里只能查进程内状态(如 bdfs 的 dirty 集)。
+
 ## 使用方注意事项
 
 从 `fetch_data` 返回 `Err` 仍会走 proxy 的同步失败应答(全 0 区间,会被拒、然后被
