@@ -1,15 +1,15 @@
 //! 百度网盘开放平台 API 客户端:blocking HTTP,供 fuser 的同步 Filesystem 直接调用。
-//! 接口对齐官方文档 https://pan.baidu.com/union/doc/ (基础网盘服务)。
+//! 接口对齐官方文档 https://pan.baidu.com/union/doc/ (基础网盘服务),
+//! 通过 pan::PanClient 暴露给 fs 层(路径寻址、三段式上传的细节都封在这)。
 
+use super::{NetFile, PanClient, PanError, PanKind};
+use crate::progress::Progress;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{Cursor, Read};
-use std::path::PathBuf;
-use std::thread::sleep;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use crate::progress::Progress;
+use std::os::unix::fs::FileExt;
 
 const OPEN_HOST: &str = "https://openapi.baidu.com";
 const PAN_HOST: &str = "https://pan.baidu.com";
@@ -21,14 +21,14 @@ const DL_UA: &str = "pan.baidu.com";
 /// 目录列表每页条数,官方建议不超过 1000
 const PAGE_LIMIT: u32 = 1000;
 
-// ---------- 上传与文件管理(写支持) ----------
+// ---------- 上传分片 ----------
 
 /// 上传分片基准大小:superfile2 的标准切片是 4MB
 pub const UPLOAD_SLICE: u64 = 4 << 20;
 
 /// 按文件大小算分片:4MB 起步;官方限制分片数 ≤1024,
 /// 超过 4MB×1024=4GB 的文件自动放大分片(取 4MB 整倍数,切片边界规整)
-pub fn upload_slice_size(file_size: u64) -> u64 {
+fn upload_slice_size(file_size: u64) -> u64 {
     let min_slice = file_size.div_ceil(1024);
     if min_slice <= UPLOAD_SLICE {
         UPLOAD_SLICE
@@ -79,55 +79,37 @@ pub struct Token {
     pub expires_at: u64,
 }
 
-/// 配置目录:~/.config/baidupan-fuse/(macOS/Linux 通用)
-pub fn config_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config").join("baidupan-fuse")
-}
-
 impl AppConfig {
-    fn path() -> PathBuf {
-        config_dir().join("config.json")
+    fn path() -> std::path::PathBuf {
+        super::config_dir().join("config.json")
     }
 
     pub fn load() -> Result<Self> {
-        let p = Self::path();
-        let raw = std::fs::read_to_string(&p)
-            .with_context(|| format!("读配置失败 {p:?},请先运行 bdfs 登录(裸跑进控制台或 bdfs login)"))?;
-        Ok(serde_json::from_str(&raw)?)
+        super::load_json(&Self::path())
+            .with_context(|| format!("读配置失败 {:?},请先运行 bdfs 登录(裸跑进控制台或 bdfs login)", Self::path()))
     }
 
     pub fn save(&self) -> Result<()> {
-        std::fs::create_dir_all(config_dir())?;
-        let p = Self::path();
-        std::fs::write(&p, serde_json::to_string_pretty(self)?)?;
-        Ok(())
+        super::save_json_atomic(&Self::path(), self)
     }
 }
 
 impl Token {
-    fn path() -> PathBuf {
-        config_dir().join("token.json")
+    fn path() -> std::path::PathBuf {
+        super::config_dir().join("token.json")
     }
 
     fn load() -> Result<Self> {
-        let p = Self::path();
-        let raw = std::fs::read_to_string(&p)
-            .with_context(|| format!("读 token 失败 {p:?},请先运行 bdfs 登录(裸跑进控制台或 bdfs login)"))?;
-        Ok(serde_json::from_str(&raw)?)
+        super::load_json(&Self::path())
+            .with_context(|| format!("读 token 失败 {:?},请先运行 bdfs 登录", Self::path()))
     }
 
     fn save(&self) -> Result<()> {
-        std::fs::create_dir_all(config_dir())?;
-        let p = Self::path();
-        std::fs::write(&p, serde_json::to_string_pretty(self)?)?;
-        Ok(())
+        super::save_json_atomic(&Self::path(), self)
     }
 }
 
-// ---------- OAuth 设备码模式 ----------
+// ---------- OAuth 登录 ----------
 
 #[derive(Deserialize)]
 struct DeviceCodeResp {
@@ -198,7 +180,7 @@ pub fn device_login(app_key: &str, app_secret: &str) -> Result<Token> {
 
     let deadline = Instant::now() + Duration::from_secs(dev.expires_in);
     while Instant::now() < deadline {
-        sleep(Duration::from_secs(dev.interval));
+        std::thread::sleep(Duration::from_secs(dev.interval));
         let resp: TokenResp = http
             .get(format!("{OPEN_HOST}/oauth/2.0/token"))
             .query(&[
@@ -295,23 +277,8 @@ fn now_secs() -> u64 {
 
 // ---------- 错误 ----------
 
-/// 百度业务错误(errno != 0),fs 层靠 downcast 到这个类型决定映射哪个 errno
-#[derive(Debug)]
-pub struct ApiError {
-    pub errno: i64,
-    pub msg: String,
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "百度 API 错误 errno={} {}", self.errno, self.msg)
-    }
-}
-
-impl std::error::Error for ApiError {}
-
-/// 响应里 errno 非 0 就提取成 ApiError
-fn as_api_err(v: &Value) -> Option<ApiError> {
+/// 响应里 errno 非 0 就提取成 PanError(-9/-7 特判,其余归 Api)
+fn as_api_err(v: &Value) -> Option<PanError> {
     let errno = v.get("errno")?.as_i64()?;
     if errno == 0 {
         return None;
@@ -322,50 +289,34 @@ fn as_api_err(v: &Value) -> Option<ApiError> {
         .and_then(|m| m.as_str())
         .unwrap_or("未知错误")
         .to_string();
-    Some(ApiError { errno, msg })
-}
-
-/// 判断下载错误是不是 CDN 403(dlink 被限流/失效的典型表现,重新获取 dlink 可自愈)
-pub fn is_forbidden(e: &anyhow::Error) -> bool {
-    e.chain()
-        .filter_map(|c| c.downcast_ref::<reqwest::Error>())
-        .any(|re| re.status() == Some(reqwest::StatusCode::FORBIDDEN))
+    Some(match errno {
+        -9 => PanError::NotFound,
+        -7 => PanError::PermissionDenied,
+        _ => PanError::Api(format!("errno={errno} {msg}")),
+    })
 }
 
 // ---------- 网盘文件模型 ----------
 
-/// 目录列表/元信息里的一个文件条目
-#[derive(Clone, Debug)]
-pub struct NetFile {
-    pub fs_id: u64,
-    /// 服务端绝对路径,如 /apps/demo/a.txt
-    pub path: String,
-    /// 显示名(server_filename)
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
-    /// server_mtime,unix 秒
-    pub mtime: i64,
-}
-
-impl NetFile {
-    fn from_value(v: &Value) -> Option<Self> {
-        Some(NetFile {
-            fs_id: v.get("fs_id")?.as_u64()?,
-            path: v.get("path")?.as_str()?.to_string(),
-            name: v
-                .get("server_filename")
-                .and_then(|s| s.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            is_dir: v.get("isdir").and_then(|d| d.as_i64())? == 1,
-            size: v.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
-            mtime: v
-                .get("server_mtime")
-                .and_then(|s| s.as_i64())
-                .unwrap_or(0),
-        })
-    }
+/// 从 list/filemetas 的条目 JSON 构建 NetFile
+fn netfile_from_value(v: &Value) -> Option<NetFile> {
+    let id = v.get("fs_id")?.as_u64()?.to_string();
+    Some(NetFile {
+        path: v.get("path")?.as_str()?.to_string(),
+        name: v
+            .get("server_filename")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        is_dir: v.get("isdir").and_then(|d| d.as_i64())? == 1,
+        size: v.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+        mtime: v
+            .get("server_mtime")
+            .and_then(|s| s.as_i64())
+            .unwrap_or(0),
+        fid: id.clone(),
+        id,
+    })
 }
 
 /// 用户信息(uinfo)
@@ -528,7 +479,7 @@ impl BaiduClient {
 
     /// 容量,返回 (总字节, 已用字节)。
     /// 注意:xpan/nas?method=quota 对部分应用报 Param error,实测 /api/quota 通用
-    pub fn quota(&mut self) -> Result<(u64, u64)> {
+    pub fn quota_raw(&mut self) -> Result<(u64, u64)> {
         let v = self.rest_get(
             "/api/quota",
             &[
@@ -543,7 +494,7 @@ impl BaiduClient {
     }
 
     /// 列目录(自动翻页拉全;大目录会多次调用,靠上层缓存兜着)
-    pub fn list_dir(&mut self, dir: &str) -> Result<Vec<NetFile>> {
+    pub fn list_dir_raw(&mut self, dir: &str) -> Result<Vec<NetFile>> {
         let mut out = Vec::new();
         let mut start: u32 = 0;
         loop {
@@ -564,7 +515,7 @@ impl BaiduClient {
                 .context("list 响应缺 list 字段")?;
             let n = list.len();
             for item in list {
-                if let Some(f) = NetFile::from_value(item) {
+                if let Some(f) = netfile_from_value(item) {
                     out.push(f);
                 }
             }
@@ -578,7 +529,7 @@ impl BaiduClient {
     }
 
     /// 查某个文件的下载直链(dlink,官方 8 小时有效,靠上层缓存)
-    pub fn get_dlink(&mut self, fs_id: u64) -> Result<String> {
+    pub fn get_dlink_raw(&mut self, fs_id: u64) -> Result<String> {
         let v = self.rest_get(
             "/rest/2.0/xpan/file",
             &[
@@ -598,7 +549,7 @@ impl BaiduClient {
 
     /// 拉一段数据:切成 parts 份并行 Range 请求,按序拼接(aria2 式多连接下载)。
     /// prog/id 用于实时进度:每个分片收到多少字节就 add 多少。
-    pub fn read_range(
+    pub fn read_range_raw(
         &self,
         dlink: &str,
         offset: u64,
@@ -657,15 +608,23 @@ impl BaiduClient {
         // dlink 本身带 query 参数,token 直接拼在后面
         let url = format!("{dlink}&access_token={token}");
         let end = offset + len - 1;
-        let mut resp = http
+        let resp = http
             .get(&url)
             .header(reqwest::header::USER_AGENT, DL_UA)
             // 实测 CDN 会 403 掉"同一 keep-alive 连接上的第二个 Range 请求",
             // 每个分片用独立连接(curl 的行为),代价只是每片一次 TLS 握手
             .header(reqwest::header::CONNECTION, "close")
             .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
-            .send()?
-            .error_for_status()?;
+            .send()?;
+        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(anyhow::Error::new(PanError::LinkExpired));
+        }
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            return Err(anyhow::Error::new(PanError::RateLimited));
+        }
+        let mut resp = resp.error_for_status()?;
         let status = resp.status();
         let mut buf = Vec::with_capacity(len as usize);
         let mut chunk = vec![0u8; 64 * 1024];
@@ -694,7 +653,7 @@ impl BaiduClient {
     /// 三段式上传第一步 precreate。
     /// 返回 None = 秒传(网盘已有同 md5 内容,到此就完成了);
     /// Some((uploadid, 还要传的分片序号)):响应里 block_list 缺省时按"全都要传"处理
-    pub fn precreate(
+    fn precreate(
         &mut self,
         path: &str,
         size: u64,
@@ -733,7 +692,7 @@ impl BaiduClient {
 
     /// 三段式上传第二步 superfile2:传一个分片,网盘按 md5 校验落临时区。
     /// token 失效时刷新后整片重传一次
-    pub fn upload_slice(
+    fn upload_slice(
         &mut self,
         uploadid: &str,
         path: &str,
@@ -796,7 +755,7 @@ impl BaiduClient {
     }
 
     /// 三段式上传第三步 create:合并分片正式落地,返回新文件的 fs_id
-    pub fn create_file(
+    fn create_file(
         &mut self,
         path: &str,
         size: u64,
@@ -821,8 +780,8 @@ impl BaiduClient {
             .context("create 响应缺 fs_id")
     }
 
-    /// 建目录(method=create 的 isdir=1 形态),返回 fs_id
-    pub fn mkdir(&mut self, path: &str) -> Result<u64> {
+    /// 建目录(method=create 的 isdir=1 形态),返回目录 id
+    fn mkdir_raw(&mut self, path: &str) -> Result<u64> {
         let v = self.rest_post(
             "/rest/2.0/xpan/file",
             &[("method".into(), "create".into())],
@@ -861,9 +820,10 @@ impl BaiduClient {
                             .get("path")
                             .and_then(|p| p.as_str())
                             .unwrap_or("?");
-                        return Err(anyhow::Error::new(ApiError {
-                            errno,
-                            msg: msg.to_string(),
+                        return Err(anyhow::Error::new(match errno {
+                            -9 => PanError::NotFound,
+                            -7 => PanError::PermissionDenied,
+                            _ => PanError::Api(format!("errno={errno} {msg}")),
                         }));
                     }
                 }
@@ -873,19 +833,154 @@ impl BaiduClient {
     }
 
     /// 删除文件/目录(filemanager 的 delete,filelist 传路径数组)
-    pub fn delete(&mut self, path: &str) -> Result<()> {
+    fn delete_raw(&mut self, path: &str) -> Result<()> {
         self.filemanager("delete", serde_json::to_string(&[path])?)
     }
 
     /// 移动/改名:path 是源,dest 是目标目录,newname 是目标目录下的新名字。
     /// 纯改名 = dest 取原父目录;统一走 move 一种格式,
     /// 避开 rename 接口 newname 格式的文档歧义(裸名还是全路径)
-    pub fn mv(&mut self, path: &str, dest: &str, newname: &str) -> Result<()> {
+    fn mv_raw(&mut self, path: &str, dest: &str, newname: &str) -> Result<()> {
         let filelist = serde_json::to_string(&[serde_json::json!({
             "path": path,
             "dest": dest,
             "newname": newname,
         })])?;
         self.filemanager("move", filelist)
+    }
+
+    /// 整文件三段式上传(原 fs.rs 的逻辑收进来):
+    /// 逐片算 md5 → precreate(秒传直接回)→ 传缺片 → create
+    fn upload_raw(
+        &mut self,
+        path: &str,
+        src: &mut std::fs::File,
+        size: u64,
+        prog: &Progress,
+    ) -> Result<NetFile> {
+        let name = path.rsplit('/').next().unwrap_or("").to_string();
+        let mk = |id: String| NetFile {
+            id: id.clone(),
+            fid: id,
+            path: path.to_string(),
+            name: name.clone(),
+            is_dir: false,
+            size,
+            mtime: now_secs() as i64,
+        };
+
+        // 分片规则:4MB 起步,>4GB 自动放大,保证 ≤1024 片(官方上限)
+        let slice = upload_slice_size(size);
+        let nblocks = size.div_ceil(slice);
+        let mut buf = vec![0u8; slice as usize];
+        let mut md5s: Vec<String> = Vec::with_capacity(nblocks as usize);
+        if nblocks == 0 {
+            // 空文件:block_list=[] 会被 precreate 拒(errno=2)。
+            // 用空串 md5 当唯一分片,实测 precreate 直接回 need=[] 免传,create 收尾
+            md5s.push(format!("{:x}", md5::compute([])));
+        }
+        for i in 0..nblocks {
+            let want = slice.min(size - i * slice) as usize;
+            src.read_exact_at(&mut buf[..want], i * slice)?;
+            md5s.push(format!("{:x}", md5::compute(&buf[..want])));
+        }
+        src.seek(SeekFrom::Start(0)).ok();
+
+        match self.precreate(path, size, &md5s)? {
+            None => Ok(mk(String::new())), // 秒传:拿不到 fs_id,id 留空
+            Some((uploadid, need)) => {
+                for seq in need {
+                    if seq >= nblocks {
+                        bail!("precreate 要分片#{seq},本地只有 {nblocks} 片");
+                    }
+                    let off = seq * slice;
+                    let want = slice.min(size - off) as usize;
+                    let mut data = vec![0u8; want];
+                    src.read_exact_at(&mut data, off)?;
+                    self.upload_slice(&uploadid, path, seq, &data, prog)?;
+                }
+                let id = self.create_file(path, size, &uploadid, &md5s)?;
+                Ok(mk(id.to_string()))
+            }
+        }
+    }
+}
+
+// ---------- PanClient 实现:把原生接口适配成统一 trait ----------
+
+impl PanClient for BaiduClient {
+    fn list_dir(&mut self, dir: &str) -> Result<Vec<NetFile>> {
+        self.list_dir_raw(dir)
+    }
+
+    fn get_dlink(&mut self, f: &NetFile) -> Result<String> {
+        let fs_id: u64 = f.id.parse().unwrap_or(0);
+        self.get_dlink_raw(fs_id)
+    }
+
+    fn read_range(
+        &self,
+        url: &str,
+        offset: u64,
+        len: u64,
+        parts: usize,
+        prog: &Progress,
+        id: u64,
+    ) -> Result<Vec<u8>> {
+        self.read_range_raw(url, offset, len, parts, prog, id)
+    }
+
+    fn upload(
+        &mut self,
+        path: &str,
+        src: &mut std::fs::File,
+        size: u64,
+        prog: &Progress,
+    ) -> Result<NetFile> {
+        self.upload_raw(path, src, size, prog)
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<NetFile> {
+        let id = self.mkdir_raw(path)?;
+        Ok(NetFile {
+            id: id.to_string(),
+            fid: id.to_string(),
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or("").to_string(),
+            is_dir: true,
+            size: 0,
+            mtime: now_secs() as i64,
+        })
+    }
+
+    fn delete(&mut self, f: &NetFile) -> Result<()> {
+        self.delete_raw(&f.path)
+    }
+
+    fn mv(&mut self, f: &NetFile, dest_dir: &str, newname: &str) -> Result<()> {
+        self.mv_raw(&f.path, dest_dir, newname)
+    }
+
+    fn quota(&mut self) -> Result<(u64, u64)> {
+        self.quota_raw()
+    }
+
+    fn account(&mut self) -> Result<String> {
+        let u = self.uinfo()?;
+        Ok(format!(
+            "百度账号:{}  网盘账号:{}  用户ID:{}  会员:{}",
+            u.baidu_name,
+            u.netdisk_name,
+            u.uk,
+            match u.vip_type {
+                2 => "超级会员",
+                1 => "会员",
+                _ => "普通",
+            }
+        ))
+    }
+
+    fn kind(&self) -> PanKind {
+        PanKind::Baidu
     }
 }

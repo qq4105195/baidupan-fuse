@@ -1,8 +1,8 @@
-//! 下载进度:挂载进程把进行中/最近完成的拉取写进 progress.json(原子写),
-//! 控制台「8. 下载进度」读同一个文件展示——最简单的文件型 IPC,零依赖。
-//! 工具目前只读(只有下载);将来做写支持时,上传进度也走这套。
+//! 下载/上传进度:挂载进程把进行中/最近完成的传输写进进度文件(原子写),
+//! 控制台「传输进度」读同一个文件展示——最简单的文件型 IPC,零依赖。
+//! 文件按网盘后端区分(progress-baidu.json / progress-wopan.json)。
 
-use crate::baidu::config_dir;
+use crate::pan::{self, PanKind};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -70,7 +70,8 @@ pub fn now_ms() -> u64 {
 }
 
 impl Progress {
-    pub fn new() -> Self {
+    /// 按后端建记录器:各网盘的挂载进程写各自的进度文件
+    pub fn new_for(kind: PanKind) -> Self {
         Self {
             inner: Arc::new(Mutex::new(State {
                 next_id: 0,
@@ -78,7 +79,7 @@ impl Progress {
                 recent: VecDeque::new(),
                 last_flush: Instant::now(),
             })),
-            file: config_dir().join("progress.json"),
+            file: pan::progress_file(kind),
         }
     }
 
@@ -148,7 +149,7 @@ impl Progress {
             running: st.running.clone(),
             recent: st.recent.iter().cloned().collect(),
         };
-        let tmp = self.file.with_file_name("progress.json.tmp");
+        let tmp = self.file.with_extension("json.tmp");
         let Ok(raw) = serde_json::to_string(&v) else {
             return;
         };

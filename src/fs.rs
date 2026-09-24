@@ -1,17 +1,19 @@
-//! FUSE 文件系统:把百度网盘目录树映射成本地挂载点(读 + 写)。
+//! FUSE 文件系统:把网盘目录树映射成本地挂载点(读 + 写),多后端通用。
 //!
 //! 设计要点:
-//! - fuser 是 inode 协议、百度 API 是路径协议,这里维护 ino↔path 双向表;
+//! - fuser 是 inode 协议、网盘 API 是路径协议,这里维护 ino↔path 双向表;
 //!   inode 单调递增不复用,会话内稳定。
 //! - 目录列表/attr 走内存缓存(TTL 可配),否则内核一次 ls 触发的几十个
-//!   lookup/getattr 会把 API 配额(未过审 10 次/小时)瞬间打爆。
+//!   lookup/getattr 会把 API 配额瞬间打爆。
 //! - mount2 默认单线程串行分发请求,天然限制了并发打 API,对配额友好
 //!   (代价是大目录 readdir 会阻塞其他操作,v1 接受)。
-//! - 写走"本地暂存 + close 时上传":改动全落 config 目录 uploads/ 下的
-//!   暂存文件,flush/release 时按官方三段式(precreate → superfile2 分片
-//!   → create)传回网盘,分片进度复用下载那套 progress.json。
+//! - 写走"本地暂存 + close 时上传":改动全落 config 目录的暂存区,
+//!   flush/release 时整文件传回网盘(各后端自己的分段/协议),进度复用
+//!   下载那套 progress 文件。
+//! - 后端差异(百度三段式、联通分片直传)全部封在 pan::PanClient 实现里,
+//!   这里只认 NetFile / PanError。
 
-use crate::baidu::{upload_slice_size, ApiError, BaiduClient, NetFile};
+use crate::pan::{NetFile, PanClient, PanError, PanKind};
 use anyhow::anyhow;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -49,7 +51,33 @@ pub fn parent_of(path: &str) -> String {
     }
 }
 
-/// 一次写会话:改动先落本地暂存文件,close(flush)时三段式传回网盘。
+/// 目录路径规范化:以 / 开头、去掉末尾 /(根保留 "/")。
+/// fs 层的 ino↔path 表用规范形式当 key,后端拿它做 path→id 映射
+pub fn normalize_dir(dir: &str) -> String {
+    let mut d = dir.trim_end_matches('/').to_string();
+    if !d.starts_with('/') {
+        d = format!("/{d}");
+    }
+    if d.is_empty() {
+        d = "/".to_string();
+    }
+    d
+}
+
+/// 查 /proc/mounts 判断挂载点当前是否挂着(叠了几层就有几行,都算)
+pub fn is_mounted(mp: &str) -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .map(|s| {
+            s.lines().any(|l| {
+                let mut it = l.split(' ');
+                it.next();
+                matches!(it.next(), Some(m) if m == mp)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 一次写会话:改动先落本地暂存文件,close(flush)时传回网盘。
 /// [0,len) 已物化;[len,target) 是"旧远端数据/0"的虚段,上传前统一回填
 /// (暂存文件是新建的,没写过的区间天然读作 0,只有旧远端数据要真回填)
 struct WriteSession {
@@ -57,33 +85,38 @@ struct WriteSession {
     path: String,
     /// 暂存文件句柄常开,seek+write 直接写
     file: std::fs::File,
-    /// 暂存文件路径(config 目录 uploads/ 下)
+    /// 暂存文件路径(config 目录下按后端隔离的暂存区)
     tmp: PathBuf,
     /// 本地已物化前缀长度
     len: u64,
     /// 逻辑大小(getattr 看到的;可大于 len,中间是虚段)
     target: u64,
-    /// 远端旧文件的 fs_id;0 = 远端还没有这个文件
-    fs_id: u64,
-    /// 远端旧文件大小(回填的边界)
-    remote_size: u64,
+    /// 远端旧文件;None = 远端还没有这个文件(回填边界 0,上传走新建)
+    remote: Option<NetFile>,
     /// 有未上传的改动
     dirty: bool,
 }
 
 pub struct PanFs {
-    client: BaiduClient,
-    /// 挂载的远端根目录(未过审应用只能访问 /apps/<应用名>,用它挂对应目录)
+    client: Box<dyn PanClient>,
+    /// 后端种类(暂存区/进度文件按它隔离)
+    kind: PanKind,
+    /// 挂载进程的 uid/gid,文件属性恒定返回它(= 挂载者)。
+    /// 不能回 req.uid()(谁请求就显示成谁):allow_other + default_permissions
+    /// 下内核按属主+mode 检查权限,属主跟着最后一位请求方漂移会乱套
+    uid: u32,
+    gid: u32,
+    /// 挂载的远端根目录(百度未过审应用只能访问 /apps/<应用名>,用它挂对应目录)
     /// 目前只做记录,路径解析走 ino↔path 表;后续做挂载内路径校验/日志用
     #[allow(dead_code)]
     root: String,
     /// 目录列表缓存时长
     dir_ttl: Duration,
-    /// 下载直链缓存时长(官方 8 小时有效,默认保守取 30 分钟)。
-    /// 实测顺序复用同一 dlink 没问题,之前的 403 是并发波浪触发的
+    /// 下载直链缓存时长(各后端时效不同:百度 8 小时,联通更短,按后端默认配)。
+    /// 实测顺序复用同一 dlink 没问题,403(LinkExpired)时弃缓存重取
     dlink_ttl: Duration,
-    /// fs_id -> (dlink, 拉取时刻)
-    dlink_cache: HashMap<u64, (String, Instant)>,
+    /// 条目 id -> (dlink, 拉取时刻)
+    dlink_cache: HashMap<String, (String, Instant)>,
     next_ino: u64,
     ino_of: HashMap<String, u64>,
     path_of: HashMap<u64, String>,
@@ -123,7 +156,7 @@ pub struct PanFs {
 impl PanFs {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        client: BaiduClient,
+        client: Box<dyn PanClient>,
         root: &str,
         dir_ttl: u64,
         dlink_ttl: u64,
@@ -132,14 +165,12 @@ impl PanFs {
         cache_mb: u64,
     ) -> Self {
         // 规范化:必须以 / 开头,去掉末尾 /(根目录保留 "/")
-        let mut root = root.trim_end_matches('/').to_string();
-        if !root.starts_with('/') {
-            root = format!("/{root}");
-        }
-        if root.is_empty() {
-            root = "/".to_string();
-        }
+        let root = normalize_dir(root);
+        let kind = client.kind();
         let mut fs = Self {
+            kind,
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
             client,
             root: root.clone(),
             dir_ttl: Duration::from_secs(dir_ttl.max(1)),
@@ -157,12 +188,12 @@ impl PanFs {
             cache_cap: (cache_mb.max(16) << 20) as usize,
             last_read: None,
             seq_streak: 0,
-            progress: crate::progress::Progress::new(),
+            progress: crate::progress::Progress::new_for(kind),
             writes: HashMap::new(),
             write_refs: HashMap::new(),
         };
         // 写支持的暂存目录:挂载时清一遍,不留上次崩溃的残渣
-        let updir = crate::baidu::config_dir().join("uploads");
+        let updir = crate::pan::staging_dir(fs.kind);
         let _ = std::fs::remove_dir_all(&updir);
         if let Err(e) = std::fs::create_dir_all(&updir) {
             tracing::warn!("建暂存目录 {} 失败:{e}(写功能不可用)", updir.display());
@@ -198,15 +229,15 @@ impl PanFs {
     }
 
     /// 拿 dlink(带 TTL 缓存)。实测顺序复用同一 dlink 完全没问题,
-    /// filemetas 便宜但也没必要每块一查;缓存过期/被 403 时自然换新
-    fn dlink(&mut self, fs_id: u64) -> anyhow::Result<String> {
-        if let Some((d, at)) = self.dlink_cache.get(&fs_id) {
+    /// 缓存过期/被 403 时自然换新
+    fn dlink(&mut self, f: &NetFile) -> anyhow::Result<String> {
+        if let Some((d, at)) = self.dlink_cache.get(&f.id) {
             if at.elapsed() < self.dlink_ttl {
                 return Ok(d.clone());
             }
         }
-        let d = self.client.get_dlink(fs_id)?;
-        self.dlink_cache.insert(fs_id, (d.clone(), Instant::now()));
+        let d = self.client.get_dlink(f)?;
+        self.dlink_cache.insert(f.id.clone(), (d.clone(), Instant::now()));
         Ok(d)
     }
 
@@ -225,31 +256,36 @@ impl PanFs {
         &self.progress
     }
 
-    /// 统一的带重试拉取:403(dlink 失效/被限)时弃缓存换新链再来,
-    /// 最多 2 次,带递增退避。整块拉取和随机读窗口共用。
-    /// path/kind 只用于进度展示
+    /// 统一的带重试拉取:直链 403(PanError::LinkExpired,dlink 失效/被限)
+    /// 时弃缓存换新链再来,最多 2 次,带递增退避。
+    /// 整块拉取、随机读窗口、写会话回填共用。kind 只用于进度展示
     fn fetch_with_retry(
         &mut self,
-        fs_id: u64,
-        path: &str,
+        f: &NetFile,
         kind: &str,
         off: u64,
         len: u64,
     ) -> anyhow::Result<Vec<u8>> {
         let mut attempt = 0u32;
         loop {
-            let dlink = self.dlink(fs_id)?;
-            let id = self.progress.begin(path, kind, off, len);
+            let dlink = self.dlink(f)?;
+            let id = self.progress.begin(&f.path, kind, off, len);
             let r = self
                 .client
                 .read_range(&dlink, off, len, self.parallel, &self.progress, id);
             self.progress.end(id, r.is_ok());
             match r {
                 Ok(d) => return Ok(d),
-                Err(e) if attempt < 2 && crate::baidu::is_forbidden(&e) => {
+                Err(e)
+                    if attempt < 2
+                        && matches!(
+                            e.downcast_ref::<PanError>(),
+                            Some(PanError::LinkExpired)
+                        ) =>
+                {
                     attempt += 1;
                     // 403 多半意味着这条 dlink 已被限/失效,弃缓存下次换新链
-                    self.dlink_cache.remove(&fs_id);
+                    self.dlink_cache.remove(&f.id);
                     tracing::warn!("下载 403,弃 dlink 缓存换新链重试(第 {attempt} 次)");
                     std::thread::sleep(Duration::from_millis(300 * attempt as u64));
                 }
@@ -260,22 +296,15 @@ impl PanFs {
 
     /// 确保某块在缓存里:没有就整块拉(内部并发数由 --parallel 决定),
     /// 超容量按 FIFO 淘汰旧块。
-    fn ensure_block(
-        &mut self,
-        ino: u64,
-        path: &str,
-        fs_id: u64,
-        fsize: u64,
-        idx: u64,
-    ) -> anyhow::Result<()> {
+    fn ensure_block(&mut self, ino: u64, f: &NetFile, idx: u64) -> anyhow::Result<()> {
         if self.blocks.contains_key(&(ino, idx)) {
             return Ok(());
         }
         let off = idx * self.block_size;
-        let len = self.block_size.min(fsize - off);
+        let len = self.block_size.min(f.size - off);
         let t0 = Instant::now();
 
-        let data = self.fetch_with_retry(fs_id, path, &format!("块#{idx}"), off, len)?;
+        let data = self.fetch_with_retry(f, &format!("块#{idx}"), off, len)?;
 
         tracing::debug!(
             "拉块 ino={ino} #{idx}: {} 字节,{} 并发,耗时 {:.2}s",
@@ -306,7 +335,7 @@ impl PanFs {
         Ok(())
     }
 
-    fn attr(&self, req: &Request<'_>, ino: u64, nf: Option<&NetFile>) -> FileAttr {
+    fn attr(&self, ino: u64, nf: Option<&NetFile>) -> FileAttr {
         let (kind, size, mtime) = match nf {
             None => (FileType::Directory, 4096, SystemTime::now()),
             Some(f) => (
@@ -334,8 +363,8 @@ impl PanFs {
                 0o644
             },
             nlink: if kind == FileType::Directory { 2 } else { 1 },
-            uid: req.uid(),
-            gid: req.gid(),
+            uid: self.uid,
+            gid: self.gid,
             rdev: 0,
             blksize: 512,
             flags: 0,
@@ -350,13 +379,13 @@ impl PanFs {
         &mut self,
         ino: u64,
         path: String,
-        fs_id: u64,
-        remote_size: u64,
+        remote: Option<NetFile>,
     ) -> anyhow::Result<()> {
         if self.writes.contains_key(&ino) {
             return Ok(());
         }
-        let dir = crate::baidu::config_dir().join("uploads");
+        let target = remote.as_ref().map(|f| f.size).unwrap_or(0);
+        let dir = crate::pan::staging_dir(self.kind);
         std::fs::create_dir_all(&dir)?;
         let tmp = dir.join(format!("{}-{ino}.tmp", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
@@ -374,27 +403,23 @@ impl PanFs {
                 file,
                 tmp,
                 len: 0,
-                target: remote_size,
-                fs_id,
-                remote_size,
+                target,
+                remote,
                 dirty: false,
             },
         );
         Ok(())
     }
 
-    /// 查远端现状:返回 (fs_id, size);不存在 → (0,0)。
+    /// 查远端现状:Some(条目) = 远端已有;None = 远端没有。
     /// 网络错误原样往外抛(映射成 EIO),绝不把"查询失败"当"新文件"
-    fn stat_remote(&mut self, path: &str) -> anyhow::Result<(u64, u64)> {
+    fn stat_remote(&mut self, path: &str) -> anyhow::Result<Option<NetFile>> {
         let parent = parent_of(path);
         let files = self.list(&parent)?;
         match files.into_iter().find(|f| f.path == path) {
-            Some(f) if f.is_dir => Err(anyhow::Error::new(ApiError {
-                errno: -7,
-                msg: format!("{path} 是目录"),
-            })),
-            Some(f) => Ok((f.fs_id, f.size)),
-            None => Ok((0, 0)),
+            Some(f) if f.is_dir => Err(anyhow::Error::new(PanError::PermissionDenied)
+                .context(format!("{path} 是目录"))),
+            other => Ok(other),
         }
     }
 
@@ -403,26 +428,36 @@ impl PanFs {
         let Some(path) = self.path_of.get(&ino).cloned() else {
             anyhow::bail!("inode {ino} 没有路径映射");
         };
-        let (fs_id, remote_size) = self.stat_remote(&path)?;
-        self.open_write(ino, path, fs_id, remote_size)
+        let remote = self.stat_remote(&path)?;
+        self.open_write(ino, path, remote)
     }
 
     /// 把 [len,to) 的虚段物化:旧远端数据逐块回填进暂存文件。
-    /// 超过 remote_size 的部分不用写——暂存文件没写过的区间本来就读作 0
+    /// 超过旧远端大小的部分不用写——暂存文件没写过的区间本来就读作 0
     fn backfill(&mut self, ino: u64, to: u64) -> anyhow::Result<()> {
-        let (path, fs_id, remote_size, cur) = match self.writes.get(&ino) {
-            Some(s) => (s.path.clone(), s.fs_id, s.remote_size, s.len),
+        let (remote, cur) = match self.writes.get(&ino) {
+            Some(s) => (s.remote.clone(), s.len),
             None => return Ok(()),
+        };
+        let Some(remote) = remote else {
+            // 远端没有旧文件:整个虚段都是 0,稀疏扩够就行
+            if let Some(s) = self.writes.get_mut(&ino) {
+                if to > s.len {
+                    s.file.set_len(to)?;
+                    s.len = to;
+                }
+            }
+            return Ok(());
         };
         if to <= cur {
             return Ok(());
         }
-        let remote_end = to.min(remote_size);
+        let remote_end = to.min(remote.size);
         let step = 1u64 << 20;
         let mut pos = cur;
         while pos < remote_end {
             let n = step.min(remote_end - pos);
-            let data = self.fetch_with_retry(fs_id, &path, "回填", pos, n)?;
+            let data = self.fetch_with_retry(&remote, "回填", pos, n)?;
             if data.len() as u64 != n {
                 anyhow::bail!("回填数据不完整 @{pos}:要 {n} 字节,得到 {}", data.len());
             }
@@ -445,8 +480,7 @@ impl PanFs {
         Ok(())
     }
 
-    /// 上传会话:补虚段 → 逐片算 md5 → precreate → 传缺片 → create。
-    /// 秒传(precreate 返回 None)直接收尾
+    /// 上传会话:补虚段 → 整文件交给后端(百度三段式/秒传,联通分片直传)
     fn upload_session(&mut self, ino: u64) -> anyhow::Result<()> {
         let (path, tmp, target) = match self.writes.get(&ino) {
             Some(s) => (s.path.clone(), s.tmp.clone(), s.target),
@@ -455,64 +489,33 @@ impl PanFs {
         // 1) 补齐 [len,target) 虚段
         self.backfill(ino, target)?;
 
-        // 2) 分片规则:4MB 起步,>4GB 自动放大,保证 ≤1024 片(官方上限)
-        let slice = upload_slice_size(target);
-        let nblocks = target.div_ceil(slice);
-        let f = std::fs::File::open(&tmp)?;
-        let mut buf = vec![0u8; slice as usize];
-        let mut md5s: Vec<String> = Vec::with_capacity(nblocks as usize);
-        if nblocks == 0 {
-            // 空文件:block_list=[] 会被 precreate 拒(errno=2)。
-            // 用空串 md5 当唯一分片,实测 precreate 直接回 need=[] 免传,create 收尾
-            md5s.push(format!("{:x}", md5::compute(&[])));
-        }
-        for i in 0..nblocks {
-            let want = slice.min(target - i * slice) as usize;
-            f.read_exact_at(&mut buf[..want], i * slice)?;
-            md5s.push(format!("{:x}", md5::compute(&buf[..want])));
-        }
-
-        // 3~5) 三段式
-        let new_id = match self.client.precreate(&path, target, &md5s)? {
-            None => None, // 秒传
-            Some((uploadid, need)) => {
-                for seq in need {
-                    if seq >= nblocks {
-                        anyhow::bail!("precreate 要分片#{seq},本地只有 {nblocks} 片");
-                    }
-                    let off = seq * slice;
-                    let want = slice.min(target - off) as usize;
-                    let mut data = vec![0u8; want];
-                    f.read_exact_at(&mut data, off)?;
-                    self.client
-                        .upload_slice(&uploadid, &path, seq, &data, &self.progress)?;
-                }
-                Some(self.client.create_file(&path, target, &uploadid, &md5s)?)
-            }
-        };
+        // 2) 整文件上传(后端自管分段/重试/进度)
+        let mut f = std::fs::File::open(&tmp)?;
+        let nf = self.client.upload(&path, &mut f, target, &self.progress)?;
         drop(f);
-        self.finish_upload(ino, new_id);
-        tracing::info!("上传完成:{path}({target} 字节,{} 片)", nblocks);
+        self.finish_upload(ino, nf);
+        tracing::info!("上传完成:{path}({target} 字节)");
         Ok(())
     }
 
     /// 上传成功后的收尾:改会话元数据、失效父目录列表/dlink/读块缓存
-    fn finish_upload(&mut self, ino: u64, new_id: Option<u64>) {
-        let old_id = self.writes.get(&ino).map(|s| s.fs_id).unwrap_or(0);
+    fn finish_upload(&mut self, ino: u64, new: NetFile) {
+        let old = self.writes.get(&ino).and_then(|s| s.remote.clone());
         let parent = self
             .writes
             .get(&ino)
             .map(|s| parent_of(&s.path))
             .unwrap_or_default();
         if let Some(s) = self.writes.get_mut(&ino) {
-            // 秒传拿不到新 fs_id,置 0:此时 len==target,不会再有回填需求
-            s.fs_id = new_id.unwrap_or(0);
-            s.remote_size = s.target;
+            // 秒传等场景拿不到新条目 id(id 空串):此时 len==target,不会再有回填需求
+            s.remote = Some(new);
             s.len = s.target;
             s.dirty = false;
         }
-        if old_id != 0 {
-            self.dlink_cache.remove(&old_id);
+        if let Some(old) = old {
+            if !old.id.is_empty() {
+                self.dlink_cache.remove(&old.id);
+            }
         }
         if !parent.is_empty() {
             self.dir_cache.remove(&parent);
@@ -522,9 +525,9 @@ impl PanFs {
     }
 
     /// 写会话文件的 attr:按 target 大小、当前时间报
-    fn sess_attr(&self, req: &Request<'_>, ino: u64) -> FileAttr {
+    fn sess_attr(&self, ino: u64) -> FileAttr {
         let target = self.writes.get(&ino).map(|s| s.target).unwrap_or(0);
-        let mut a = self.attr(req, ino, None);
+        let mut a = self.attr(ino, None);
         a.kind = FileType::RegularFile;
         a.size = target;
         a.blocks = target.div_ceil(512);
@@ -533,18 +536,11 @@ impl PanFs {
         a
     }
 
-    /// 读一个写会话中的文件:[0,len) 从暂存文件读,[len,remote_size) 回源拉,
+    /// 读一个写会话中的文件:[0,len) 从暂存文件读,[len,旧远端大小) 回源拉,
     /// 再往后是虚段 0。不改会话状态(读不物化)
     fn read_session(&mut self, ino: u64, offset: u64, size: u32, reply: ReplyData) {
-        let (path, fs_id, remote_size, len, tmp, target) = match self.writes.get(&ino) {
-            Some(s) => (
-                s.path.clone(),
-                s.fs_id,
-                s.remote_size,
-                s.len,
-                s.tmp.clone(),
-                s.target,
-            ),
+        let (remote, len, tmp, target) = match self.writes.get(&ino) {
+            Some(s) => (s.remote.clone(), s.len, s.tmp.clone(), s.target),
             None => {
                 reply.error(libc::ENOENT);
                 return;
@@ -570,9 +566,13 @@ impl PanFs {
         }
         // 未物化但属于旧远端的部分
         let mut pos = offset.max(len);
-        while pos < end.min(remote_size) {
-            let step = (1u64 << 20).min(end.min(remote_size) - pos);
-            match self.fetch_with_retry(fs_id, &path, "回填读", pos, step) {
+        while pos < end.min(remote.as_ref().map(|f| f.size).unwrap_or(0)) {
+            let step = (1u64 << 20).min(end.min(remote.as_ref().map(|f| f.size).unwrap_or(0)) - pos);
+            match remote
+                .as_ref()
+                .map(|f| self.fetch_with_retry(f, "回填读", pos, step))
+                .unwrap_or(Ok(vec![0u8; step as usize]))
+            {
                 Ok(data) => {
                     if data.len() as u64 != step {
                         reply.error(libc::EIO);
@@ -637,12 +637,14 @@ impl PanFs {
             reply.error(if want_dir { libc::ENOTDIR } else { libc::EISDIR });
             return;
         }
-        if let Err(e) = self.client.delete(&f.path) {
+        if let Err(e) = self.client.delete(&f) {
             reply.error(map_err(&e));
             return;
         }
         self.dir_cache.remove(&parent_path);
-        self.dlink_cache.remove(&f.fs_id);
+        if !f.id.is_empty() {
+            self.dlink_cache.remove(&f.id);
+        }
         // 正在写的会话/读缓存一并清
         if let Some(ino) = self.ino_of.remove(&f.path) {
             self.path_of.remove(&ino);
@@ -654,12 +656,12 @@ impl PanFs {
 }
 
 /// 把 anyhow 错误映射成内核 errno:
-/// -9 文件不存在 → ENOENT;-7 无权限 → EACCES;其余(网络/限频)→ EIO
+/// NotFound → ENOENT;PermissionDenied → EACCES;其余(网络/限频)→ EIO
 fn map_err(e: &anyhow::Error) -> i32 {
-    if let Some(api) = e.downcast_ref::<ApiError>() {
-        match api.errno {
-            -9 => return libc::ENOENT,
-            -7 => return libc::EACCES,
+    if let Some(pe) = e.downcast_ref::<PanError>() {
+        match pe {
+            PanError::NotFound => return libc::ENOENT,
+            PanError::PermissionDenied => return libc::EACCES,
             _ => {}
         }
     }
@@ -669,7 +671,7 @@ fn map_err(e: &anyhow::Error) -> i32 {
 
 impl Filesystem for PanFs {
     /// 在父目录里找名字。内核每次路径解析都会来问,是调用最频繁的入口。
-    fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let Some(parent_path) = self.path_of.get(&parent).cloned() else {
             reply.error(libc::ENOENT);
             return;
@@ -683,7 +685,7 @@ impl Filesystem for PanFs {
             .find(|(_, s)| s.path == target)
             .map(|(ino, _)| *ino)
         {
-            reply.entry(&TTL, &self.sess_attr(req, ino), 0);
+            reply.entry(&TTL, &self.sess_attr(ino), 0);
             return;
         }
 
@@ -691,7 +693,7 @@ impl Filesystem for PanFs {
             Ok(files) => match files.iter().find(|f| f.name == name) {
                 Some(f) => {
                     let ino = self.alloc_ino(&f.path);
-                    let attr = self.attr(req, ino, Some(f));
+                    let attr = self.attr(ino, Some(f));
                     reply.entry(&TTL, &attr, 0);
                 }
                 None => reply.error(libc::ENOENT),
@@ -700,22 +702,22 @@ impl Filesystem for PanFs {
         }
     }
 
-    fn getattr(&mut self, req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let Some(path) = self.path_of.get(&ino).cloned() else {
             reply.error(libc::ENOENT);
             return;
         };
         // 写会话中的文件:大小/时间以会话为准,不去问远端
         if self.writes.contains_key(&ino) {
-            reply.attr(&TTL, &self.sess_attr(req, ino));
+            reply.attr(&TTL, &self.sess_attr(ino));
             return;
         }
         if ino == ROOT_INO {
-            reply.attr(&TTL, &self.attr(req, ino, None));
+            reply.attr(&TTL, &self.attr(ino, None));
             return;
         }
         match self.find(&path) {
-            Ok(f) => reply.attr(&TTL, &self.attr(req, ino, Some(&f))),
+            Ok(f) => reply.attr(&TTL, &self.attr(ino, Some(&f))),
             Err(e) => reply.error(map_err(&e)),
         }
     }
@@ -854,7 +856,7 @@ impl Filesystem for PanFs {
         self.last_read = Some((ino, offset + n));
 
         if self.seq_streak < 2 {
-            match self.fetch_with_retry(f.fs_id, &path, "随机读", offset, n) {
+            match self.fetch_with_retry(&f, "随机读", offset, n) {
                 Ok(data) => {
                     if data.len() as u64 != n {
                         reply.error(libc::EIO);
@@ -880,7 +882,7 @@ impl Filesystem for PanFs {
         };
 
         for idx in idx0..=prefetch_end {
-            if let Err(e) = self.ensure_block(ino, &path, f.fs_id, f.size, idx) {
+            if let Err(e) = self.ensure_block(ino, &f, idx) {
                 reply.error(map_err(&e));
                 return;
             }
@@ -905,7 +907,7 @@ impl Filesystem for PanFs {
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &mut self,
-        req: &Request<'_>,
+        _req: &Request<'_>,
         ino: u64,
         _mode: Option<u32>,
         _uid: Option<u32>,
@@ -927,10 +929,10 @@ impl Filesystem for PanFs {
         };
         let Some(new_size) = size else {
             if self.writes.contains_key(&ino) {
-                reply.attr(&TTL, &self.sess_attr(req, ino));
+                reply.attr(&TTL, &self.sess_attr(ino));
             } else {
                 match self.find(&path) {
-                    Ok(f) => reply.attr(&TTL, &self.attr(req, ino, Some(&f))),
+                    Ok(f) => reply.attr(&TTL, &self.attr(ino, Some(&f))),
                     Err(e) => reply.error(map_err(&e)),
                 }
             }
@@ -938,7 +940,7 @@ impl Filesystem for PanFs {
         };
         // truncate:没有会话就建一个(独立 truncate 命令的路径)
         if !self.writes.contains_key(&ino) {
-            let (fs_id, remote_size) = match self.stat_remote(&path) {
+            let remote = match self.stat_remote(&path) {
                 Ok(v) => v,
                 Err(e) => {
                     reply.error(map_err(&e));
@@ -947,11 +949,11 @@ impl Filesystem for PanFs {
             };
             // 远端没有这个文件:独立 truncate 对不存在的文件该报 ENOENT
             // (shell 的 `> 新文件` 走 create 钩子,不会到这)
-            if fs_id == 0 {
+            if remote.is_none() {
                 reply.error(libc::ENOENT);
                 return;
             }
-            if let Err(e) = self.open_write(ino, path.clone(), fs_id, remote_size) {
+            if let Err(e) = self.open_write(ino, path.clone(), remote) {
                 reply.error(map_err(&e));
                 return;
             }
@@ -981,13 +983,13 @@ impl Filesystem for PanFs {
                 return;
             }
         }
-        reply.attr(&TTL, &self.sess_attr(req, ino));
+        reply.attr(&TTL, &self.sess_attr(ino));
     }
 
     /// 建文件节点:只支持普通文件;create 钩子没接住的路径会落到这
     fn mknod(
         &mut self,
-        req: &Request<'_>,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -1007,17 +1009,17 @@ impl Filesystem for PanFs {
         let path = join_path(&parent_path, &name.to_string_lossy());
         let ino = self.alloc_ino(&path);
         match self.stat_remote(&path) {
-            Ok((fs_id, _)) => {
-                if fs_id != 0 {
+            Ok(remote) => {
+                if remote.is_some() {
                     // 已存在:POSIX 语义是不动它
                     match self.find(&path) {
-                        Ok(f) => reply.entry(&TTL, &self.attr(req, ino, Some(&f)), 0),
+                        Ok(f) => reply.entry(&TTL, &self.attr(ino, Some(&f)), 0),
                         Err(e) => reply.error(map_err(&e)),
                     }
                     return;
                 }
                 // 新文件:mknod 不会跟 open/release,立即上传空文件
-                if let Err(e) = self.open_write(ino, path, 0, 0) {
+                if let Err(e) = self.open_write(ino, path, None) {
                     reply.error(map_err(&e));
                     return;
                 }
@@ -1029,7 +1031,7 @@ impl Filesystem for PanFs {
                     reply.error(map_err(&e));
                     return;
                 }
-                reply.entry(&TTL, &self.sess_attr(req, ino), 0);
+                reply.entry(&TTL, &self.sess_attr(ino), 0);
             }
             Err(e) => reply.error(map_err(&e)),
         }
@@ -1038,7 +1040,7 @@ impl Filesystem for PanFs {
     /// 建目录:直接调网盘接口,成功后失效父目录缓存
     fn mkdir(
         &mut self,
-        req: &Request<'_>,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         _mode: u32,
@@ -1052,22 +1054,10 @@ impl Filesystem for PanFs {
         let name = name.to_string_lossy();
         let path = join_path(&parent_path, &name);
         match self.client.mkdir(&path) {
-            Ok(fs_id) => {
+            Ok(nf) => {
                 self.dir_cache.remove(&parent_path);
-                let ino = self.alloc_ino(&path);
-                let mtime = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let nf = NetFile {
-                    fs_id,
-                    path,
-                    name: name.to_string(),
-                    is_dir: true,
-                    size: 0,
-                    mtime,
-                };
-                reply.entry(&TTL, &self.attr(req, ino, Some(&nf)), 0);
+                let ino = self.alloc_ino(&nf.path);
+                reply.entry(&TTL, &self.attr(ino, Some(&nf)), 0);
             }
             Err(e) => reply.error(map_err(&e)),
         }
@@ -1109,7 +1099,7 @@ impl Filesystem for PanFs {
             .ino_of
             .get(&from)
             .and_then(|&ino| self.writes.get(&ino))
-            .is_some_and(|s| s.fs_id == 0);
+            .is_some_and(|s| s.remote.as_ref().map(|f| f.id.is_empty()).unwrap_or(true));
         if remote_missing {
             if let Some(ino) = self.ino_of.remove(&from) {
                 self.ino_of.insert(to.clone(), ino);
@@ -1131,11 +1121,14 @@ impl Filesystem for PanFs {
                         reply.error(libc::EISDIR);
                         return;
                     }
-                    if let Err(e) = self.client.delete(&t.path) {
+                    if let Err(e) = self.client.delete(&t) {
                         reply.error(map_err(&e));
                         return;
                     }
                     self.dir_cache.remove(&dest_dir);
+                    if !t.id.is_empty() {
+                        self.dlink_cache.remove(&t.id);
+                    }
                     if let Some(ino) = self.ino_of.remove(&t.path) {
                         self.path_of.remove(&ino);
                         self.drop_session(ino);
@@ -1149,7 +1142,15 @@ impl Filesystem for PanFs {
             }
         }
 
-        if let Err(e) = self.client.mv(&from, &dest_dir, &newname) {
+        // 源条目(改名/移动要按后端自己的标识操作)
+        let src = match self.find(&from) {
+            Ok(f) => f,
+            Err(e) => {
+                reply.error(map_err(&e));
+                return;
+            }
+        };
+        if let Err(e) = self.client.mv(&src, &dest_dir, &newname) {
             reply.error(map_err(&e));
             return;
         }
@@ -1169,7 +1170,7 @@ impl Filesystem for PanFs {
     /// 建并打开文件:查一下远端旧状态(覆盖写场景),开写会话
     fn create(
         &mut self,
-        req: &Request<'_>,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         _mode: u32,
@@ -1183,26 +1184,26 @@ impl Filesystem for PanFs {
         };
         let path = join_path(&parent_path, &name.to_string_lossy());
         let ino = self.alloc_ino(&path);
-        let (fs_id, remote_size) = match self.stat_remote(&path) {
+        let remote = match self.stat_remote(&path) {
             Ok(v) => v,
             Err(e) => {
                 reply.error(map_err(&e));
                 return;
             }
         };
-        if let Err(e) = self.open_write(ino, path, fs_id, remote_size) {
+        if let Err(e) = self.open_write(ino, path, remote) {
             reply.error(map_err(&e));
             return;
         }
         // 新建的文件也标 dirty:touch/O_CREAT 场景 close 时把空文件传上去
-        if fs_id == 0 {
+        if self.writes.get(&ino).is_some_and(|s| s.remote.is_none()) {
             if let Some(s) = self.writes.get_mut(&ino) {
                 s.dirty = true;
             }
         }
         *self.write_refs.entry(ino).or_insert(0) += 1;
         // fh=1 标记写句柄(open 那套约定)
-        reply.created(&TTL, &self.sess_attr(req, ino), 0, 1, 0);
+        reply.created(&TTL, &self.sess_attr(ino), 0, 1, 0);
     }
 
     /// 写文件:全落本地暂存,真正的上传发生在 flush/release/fsync
@@ -1355,5 +1356,13 @@ mod tests {
         assert_eq!(parent_of("/"), "/");
         assert_eq!(parent_of("/a"), "/");
         assert_eq!(parent_of("/apps/d/f.txt"), "/apps/d");
+    }
+
+    #[test]
+    fn 目录规范化() {
+        assert_eq!(normalize_dir("/"), "/");
+        assert_eq!(normalize_dir("///"), "/");
+        assert_eq!(normalize_dir("/a/b/"), "/a/b");
+        assert_eq!(normalize_dir("a/b"), "/a/b");
     }
 }
